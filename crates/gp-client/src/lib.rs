@@ -2,6 +2,8 @@
 //! optee_client remains a behavioral stand-in until this C ABI is bit-identical.
 //! Transport: rustee-virt.ko or the vsock helper below. No parallel Client API.
 
+pub mod wire;
+
 use rustee_proto::{
     answer_fast_smccc, decode_msg, write_msg, CallFrame, MsgArgHdr, MsgParam, PduHeader,
     ATTR_META, ATTR_TYPE_NONE, ATTR_TYPE_TMEM_INOUT, ATTR_TYPE_TMEM_INPUT, ATTR_TYPE_TMEM_OUTPUT,
@@ -18,6 +20,7 @@ pub const TEEC_ERROR_BAD_PARAMETERS: u32 = 0xFFFF_0006;
 pub const TEEC_ERROR_BAD_STATE: u32 = 0xFFFF_0007;
 pub const TEEC_ERROR_COMMUNICATION: u32 = 0xFFFF_000E;
 pub const TEEC_ERROR_OUT_OF_MEMORY: u32 = 0xFFFF_000C;
+pub const TEEC_ERROR_BUSY: u32 = 0xFFFF_000D;
 pub const TEEC_ORIGIN_API: u32 = 1;
 pub const TEEC_ORIGIN_COMMS: u32 = 2;
 pub const TEEC_ORIGIN_TEE: u32 = 3;
@@ -57,7 +60,7 @@ impl Uuid {
 
 /// Yielding vsock transport. Fast SMCCC is local and never goes through this.
 pub trait Transport {
-    fn enter(&mut self, frame: CallFrame, bounce: &[u8], bounce_len: u32) -> Result<CallFrame, u32>;
+    fn enter(&mut self, frame: CallFrame, bounce: &mut [u8], bounce_len: u32) -> Result<CallFrame, u32>;
 }
 
 /// In-memory loopback: COMPLETE with ret SUCCESS, copies bounce back.
@@ -76,7 +79,7 @@ impl Default for Loopback {
 }
 
 impl Transport for Loopback {
-    fn enter(&mut self, frame: CallFrame, bounce: &[u8], bounce_len: u32) -> Result<CallFrame, u32> {
+    fn enter(&mut self, frame: CallFrame, bounce: &mut [u8], bounce_len: u32) -> Result<CallFrame, u32> {
         let _ = bounce_len;
         self.last_kind = KIND_ENTER;
         self.last_cookie = frame.cookie();
@@ -84,7 +87,6 @@ impl Transport for Loopback {
             return Err(TEEC_ERROR_COMMUNICATION);
         }
         let (mut hdr, params, _) = decode_msg(bounce, frame.cookie()).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
-        let _ = params;
         hdr.ret = TEEC_SUCCESS;
         hdr.ret_origin = TEEC_ORIGIN_TEE;
         if hdr.cmd == MSG_CMD_OPEN_SESSION {
@@ -93,10 +95,7 @@ impl Transport for Loopback {
         let n = hdr.num_params as usize;
         let mut pbuf = [MsgParam::default(); 6];
         pbuf[..n].copy_from_slice(&params[..n]);
-        let mut tmp = bounce.to_vec();
-        write_msg(&mut tmp, frame.cookie(), hdr, &pbuf[..n]).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
-        // Loopback cannot mutate caller's bounce through &[u8]; tests write back via a cell.
-        let _ = tmp;
+        write_msg(bounce, frame.cookie(), hdr, &pbuf[..n]).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
         Ok(frame)
     }
 }
@@ -159,7 +158,7 @@ impl<T: Transport> Context<T> {
         let frame = CallFrame::yielding_enter(cookie);
         let _ = self.seq;
         let _ = n;
-        self.transport.enter(frame, &self.bounce, (cookie as u32) + n as u32)?;
+        self.transport.enter(frame, &mut self.bounce, (cookie as u32) + n as u32)?;
         let (out, _, _) = decode_msg(&self.bounce, cookie).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
         if out.ret != TEEC_SUCCESS {
             return Err(out.ret);
@@ -178,7 +177,7 @@ impl<T: Transport> Context<T> {
         };
         write_msg(&mut self.bounce, cookie, hdr, &[]).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(cookie);
-        self.transport.enter(frame, &self.bounce, cookie as u32 + 32)?;
+        self.transport.enter(frame, &mut self.bounce, cookie as u32 + 32)?;
         Ok(())
     }
 
@@ -192,7 +191,7 @@ impl<T: Transport> Context<T> {
         };
         write_msg(&mut self.bounce, cookie, hdr, &[]).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(cookie);
-        self.transport.enter(frame, &self.bounce, cookie as u32 + 32)?;
+        self.transport.enter(frame, &mut self.bounce, cookie as u32 + 32)?;
         Ok(())
     }
 
@@ -209,7 +208,7 @@ impl<T: Transport> Context<T> {
         let p = [MsgParam::tmem(ATTR_TYPE_TMEM_INPUT, cookie, size as u64, cookie)];
         write_msg(&mut self.bounce, 32, hdr, &p).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(32);
-        self.transport.enter(frame, &self.bounce, 64)?;
+        self.transport.enter(frame, &mut self.bounce, 64)?;
         Ok(cookie)
     }
 
@@ -222,7 +221,7 @@ impl<T: Transport> Context<T> {
         let p = [MsgParam::rmem(rustee_proto::ATTR_TYPE_RMEM_INPUT, 0, 0, cookie)];
         write_msg(&mut self.bounce, 32, hdr, &p).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(32);
-        self.transport.enter(frame, &self.bounce, 64)?;
+        self.transport.enter(frame, &mut self.bounce, 64)?;
         Ok(())
     }
 }
