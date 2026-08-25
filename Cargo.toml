@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustee-hal",
+    "crates/rustee-hal-virt",
+    "crates/rustee-hal-tz",
+    "crates/rustee-proto",
+    "crates/rustee-os",
+    "crates/rustee-utee",
+    "crates/rustee-crypto",
+    "crates/rustee-storage",
+    "crates/gp-client",
+    "host/rustee-supplicant",
+    "ta/hello-rs",
+    "tests/smoke",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bjm9991/rustee"
+rust-version = "1.77"
+
+[workspace.dependencies]
+rustee-hal = { path = "crates/rustee-hal" }
+rustee-crypto = { path = "crates/rustee-crypto" }
+rustee-utee = { path = "crates/rustee-utee" }
