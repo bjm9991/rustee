@@ -134,7 +134,7 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         if let Some(id) = self.current_instance.take() {
             if let Some(inst) = self.instances.get_mut(id) {
                 inst.state = InstanceState::Dead;
-                if let Some(aspace) = inst.aspace.take() {
+                if let Some(mut aspace) = inst.aspace.take() {
                     aspace.drop_all();
                 }
             }
@@ -343,7 +343,7 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                         inst.session_count = inst.session_count.saturating_sub(1);
                         if inst.session_count == 0 && !inst.props.instance_keep_alive {
                             inst.state = InstanceState::Dead;
-                            if let Some(aspace) = inst.aspace.take() {
+                            if let Some(mut aspace) = inst.aspace.take() {
                                 aspace.drop_all();
                             }
                             self.instances.drop_id(iid);
@@ -406,60 +406,57 @@ mod tests {
     use super::*;
     use rustee_crypto::SoftwareProvider;
     use rustee_hal::{
-        CallFrame, CallGate, Entropy, EntropyOrigin, Huk, SharedMem, ShmMapping, TaAddressSpace,
+        AddressSpace, BootInfo, CallFrame, CallGate, Entropy, EntropyOrigin, HalError, Huk,
+        Perms, SharedMem, Unsupported, VirtAddr,
     };
 
     struct MockGate;
     impl CallGate for MockGate {
-        type Error = ();
-        fn recv(&mut self) -> Result<CallFrame, ()> {
-            Err(())
+        fn recv(&mut self) -> Result<CallFrame, HalError> {
+            Err(HalError::Unsupported)
         }
-        fn complete(&mut self, _: CallFrame) -> Result<(), ()> {
-            Err(())
+        fn complete(&mut self, _: CallFrame) -> Result<(), HalError> {
+            Err(HalError::Unsupported)
         }
-        fn rpc_yield(&mut self, _: CallFrame) -> Result<CallFrame, ()> {
-            Err(())
+        fn rpc_yield(&mut self, _: CallFrame) -> Result<CallFrame, HalError> {
+            Err(HalError::Unsupported)
         }
     }
 
     struct MockAs;
-    impl TaAddressSpace for MockAs {
-        type Error = ();
-        fn map_image(&mut self, _: &[[u64; 2]]) -> Result<(), ()> {
+    impl AddressSpace for MockAs {
+        fn map_image(&mut self, _: VirtAddr, _: &[u8], _: Perms) -> Result<(), HalError> {
             Ok(())
         }
-        fn map_shm(&mut self, _: &impl ShmMapping, perms: u32) -> Result<u64, ()> {
-            if perms & PERM_EXEC != 0 && perms & PERM_SHM != 0 {
-                return Err(());
+        fn map_shm(&mut self, _: &impl SharedMem, perms: Perms) -> Result<VirtAddr, HalError> {
+            if perms.exec {
+                return Err(HalError::PermDenied);
             }
-            Ok(0)
+            Ok(VirtAddr(0))
         }
-        fn unmap(&mut self, _: u64, _: usize) -> Result<(), ()> {
-            Ok(())
-        }
-        fn drop_all(self) {}
+        fn unmap(&mut self, _: VirtAddr) {}
+        fn drop_all(&mut self) {}
     }
 
     struct MockShm;
-    impl ShmMapping for MockShm {
+    impl SharedMem for MockShm {
         fn cookie(&self) -> u64 {
             0
         }
         fn len(&self) -> usize {
             0
         }
-        fn perms(&self) -> u32 {
-            PERM_READ | PERM_WRITE | PERM_SHM
+        fn perms(&self) -> Perms {
+            Perms::RW
         }
-    }
-    impl SharedMem for MockShm {
-        type Error = ();
-        fn sync_in(&mut self) -> Result<(), ()> {
+        fn sync_in(&mut self) -> Result<(), HalError> {
             Ok(())
         }
-        fn sync_out(&mut self) -> Result<(), ()> {
+        fn sync_out(&mut self) -> Result<(), HalError> {
             Ok(())
+        }
+        fn map_into(&self, aspace: &mut impl AddressSpace, perms: Perms) -> Result<VirtAddr, HalError> {
+            aspace.map_shm(self, perms)
         }
     }
 
@@ -486,10 +483,40 @@ mod tests {
         type SharedMem = MockShm;
         type Entropy = MockEnt;
         type Huk = MockHuk;
-        type Monotonic = ();
-        type SecureTime = ();
-        type Irq = ();
-        type Error = ();
+        type Monotonic = Unsupported;
+        type SecureTime = Unsupported;
+        type Irq = Unsupported;
+
+        fn call_gate(&mut self) -> &mut Self::CallGate {
+            unimplemented!()
+        }
+        fn entropy(&mut self) -> &mut Self::Entropy {
+            unimplemented!()
+        }
+        fn huk(&self) -> &Self::Huk {
+            unimplemented!()
+        }
+        fn monotonic(&mut self) -> Option<&mut Self::Monotonic> {
+            None
+        }
+        fn secure_time(&self) -> Option<&Self::SecureTime> {
+            None
+        }
+        fn irq(&mut self) -> Option<&mut Self::Irq> {
+            None
+        }
+        fn init(_: BootInfo) -> Result<Self, HalError> {
+            Ok(MockHal)
+        }
+        fn new_address_space(&mut self) -> Self::AddressSpace {
+            MockAs
+        }
+        fn lookup_shm(&self, _: u64) -> Option<&Self::SharedMem> {
+            None
+        }
+        fn lookup_shm_mut(&mut self, _: u64) -> Option<&mut Self::SharedMem> {
+            None
+        }
     }
 
     struct EchoPta(Uuid);
@@ -819,9 +846,50 @@ mod tests {
     #[test]
     fn exec_plus_shm_illegal() {
         let mut aspace = MockAs;
-        assert!(aspace
-            .map_shm(&MockShm, PERM_EXEC | PERM_SHM)
-            .is_err());
-        assert!(aspace.map_shm(&MockShm, PERM_READ | PERM_SHM).is_ok());
+        let exec = Perms { read: true, write: false, exec: true };
+        assert!(aspace.map_shm(&MockShm, exec).is_err());
+        assert!(aspace.map_shm(&MockShm, Perms::RW).is_ok());
+    }
+
+    #[test]
+    fn rtsg_verifies_with_v0_pubkey() {
+        let mut uuidb = [0u8; 16];
+        for i in 0..16 {
+            uuidb[i] = i as u8;
+        }
+        let uuid = Uuid(uuidb);
+        let props = TaProperties {
+            uuid,
+            stack_size: 4096,
+            data_size: 8192,
+            single_instance: true,
+            multi_session: true,
+            instance_keep_alive: false,
+            endian: 0,
+            ta_version: 1,
+        };
+        let elf = encode_ta_head(&props);
+        let crypto = SoftwareProvider;
+        let mut hashed = alloc::vec::Vec::new();
+        hashed.extend_from_slice(&uuid.0);
+        hashed.extend_from_slice(&1u32.to_le_bytes());
+        hashed.extend_from_slice(&elf);
+        let digest = crypto.sha256(&hashed);
+        let sig = include_bytes!("testdata/v0-rtsg.sig");
+        assert!(crypto.rsa_pkcs1_verify(V0_DEV_PUBKEY, &digest, sig));
+        let mut img = alloc::vec::Vec::new();
+        img.extend_from_slice(&crate::header::RTSG_MAGIC.to_le_bytes());
+        img.extend_from_slice(&0u16.to_le_bytes());
+        img.extend_from_slice(&1u16.to_le_bytes());
+        img.extend_from_slice(&uuid.0);
+        img.extend_from_slice(&1u32.to_le_bytes());
+        img.extend_from_slice(&(elf.len() as u32).to_le_bytes());
+        img.extend_from_slice(&32u16.to_le_bytes());
+        img.extend_from_slice(&(sig.len() as u16).to_le_bytes());
+        img.extend_from_slice(&digest);
+        img.extend_from_slice(sig);
+        img.extend_from_slice(&elf);
+        let loaded = load_image(&crypto, &img).expect("rtsg verify");
+        assert_eq!(loaded.props.uuid, uuid);
     }
 }
