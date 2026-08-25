@@ -6,6 +6,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+rustee-proto = { path = "../../crates/rustee-proto" }
+
+[lib]
+name = "rustee_supplicant"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rustee-supplicant"
 path = "src/main.rs"
