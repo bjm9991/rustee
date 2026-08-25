@@ -8,4 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 gp-client = { path = "../../crates/gp-client" }
-rustee-proto = { path = "../../crates/rustee-proto" }
+rustee-supplicant = { path = "../../host/rustee-supplicant" }
+
+[[bin]]
+name = "hello-ca"
+path = "src/bin/hello-ca.rs"
