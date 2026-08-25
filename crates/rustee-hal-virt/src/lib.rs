@@ -210,6 +210,8 @@ impl SharedMem for VirtShm {
 
 pub struct VirtAs {
     mapped: usize,
+    /// Guest VA of bounce pool base. cookie is an offset; map_shm returns base+cookie.
+    pool_va: u64,
 }
 
 impl AddressSpace for VirtAs {
@@ -229,8 +231,13 @@ impl AddressSpace for VirtAs {
         if shm.len() == 0 {
             return Err(HalError::InvalidParam);
         }
+        let start = shm.cookie();
+        let end = start.checked_add(shm.len() as u64).ok_or(HalError::InvalidParam)?;
+        if end as usize > BOUNCE_POOL_SIZE {
+            return Err(HalError::InvalidParam);
+        }
         self.mapped = self.mapped.saturating_add(1);
-        Ok(VirtAddr(shm.cookie()))
+        Ok(VirtAddr(self.pool_va.wrapping_add(start)))
     }
 
     fn unmap(&mut self, _va: VirtAddr) {
@@ -251,6 +258,7 @@ pub struct VirtHal {
     gate: VirtCallGate,
     bounce: PhysRegion,
     bounce_mem: Vec<u8>,
+    pool_va: u64,
     entropy: VirtEntropy,
     huk: VirtHuk,
     shms: [Option<VirtShm>; 32],
@@ -276,9 +284,6 @@ impl VirtHal {
         let end = start.checked_add(bounce.len()).ok_or(HalError::InvalidParam)?;
         if end > self.bounce.len {
             return Err(HalError::InvalidParam);
-        }
-        if self.bounce_mem.len() < end {
-            self.bounce_mem.resize(end, 0);
         }
         self.bounce_mem[start..end].copy_from_slice(bounce);
         Ok(())
@@ -416,6 +421,9 @@ impl Hal for VirtHal {
         if info.shm_pool.len != BOUNCE_POOL_SIZE {
             return Err(HalError::InvalidParam);
         }
+        let mut bounce_mem = Vec::new();
+        bounce_mem.resize(BOUNCE_POOL_SIZE, 0);
+        let pool_va = bounce_mem.as_ptr() as u64;
         Ok(Self {
             gate: VirtCallGate {
                 yielding: false,
@@ -426,7 +434,8 @@ impl Hal for VirtHal {
                 last_bounce_len: 0,
             },
             bounce: info.shm_pool,
-            bounce_mem: Vec::new(),
+            bounce_mem,
+            pool_va,
             entropy: VirtEntropy::new(),
             huk: VirtHuk { bytes: *b"RUSTEE-VIRT-DEV-HUK-NOT-SECRET!!" },
             shms: [(); 32].map(|_| None),
@@ -438,7 +447,9 @@ impl Hal for VirtHal {
             conn: None,
         })
     }
-    fn new_address_space(&mut self) -> Self::AddressSpace { VirtAs { mapped: 0 } }
+    fn new_address_space(&mut self) -> Self::AddressSpace {
+        VirtAs { mapped: 0, pool_va: self.pool_va }
+    }
     fn lookup_shm(&self, cookie: u64) -> Option<&Self::SharedMem> {
         self.shms.iter().filter_map(|s| s.as_ref()).find(|s| s.cookie() == cookie)
     }
@@ -471,6 +482,14 @@ mod tests {
         shm.sync_in().unwrap();
         shm.sync_out().unwrap();
         assert!(h.import_shm(0, 16, Perms::RX).is_err());
+        let mut aspace = h.new_address_space();
+        let shm = h.lookup_shm(0x1000).unwrap();
+        let va = aspace.map_shm(shm, Perms::RW).unwrap();
+        assert_ne!(va.0, 0x1000, "map_shm must not return the cookie as a VA");
+        unsafe {
+            core::ptr::write(va.0 as *mut u8, 0x42);
+        }
+        assert_eq!(h.bounce_at(0x1000, 1).unwrap()[0], 0x42);
     }
 
     #[test]
