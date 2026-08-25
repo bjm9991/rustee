@@ -96,6 +96,10 @@ impl VsockListener {
         self.listening = true;
     }
 
+    pub fn is_listening(&self) -> bool {
+        self.listening
+    }
+
     /// Answer a host connect REQUEST. Guest is dst (CID 3 port 7007).
     pub fn accept(&self, req: &VirtioVsockHdr) -> Result<VirtioVsockHdr, HalError> {
         if !self.listening {

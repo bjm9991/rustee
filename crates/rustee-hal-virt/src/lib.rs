@@ -37,7 +37,9 @@ pub const KIND_COMPLETE: u32 = 3;
 pub const KIND_RPC_REPLY: u32 = 4;
 pub const MSG_ARG_ALIGN: usize = 8;
 
+mod rng;
 mod vsock;
+pub use rng::{VirtEntropy, VIRTIO_ID_RNG, VIRTIO_PCI_DEVICE_RNG};
 pub use vsock::{
     encode_pdu, read_pdu, VirtioVsockHdr, VsockConn, VsockListener, VIRTIO_PCI_DEVICE_VSOCK,
     VIRTIO_PCI_VENDOR, VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
@@ -240,18 +242,6 @@ impl AddressSpace for VirtAs {
     }
 }
 
-pub struct VirtEntropy;
-impl Entropy for VirtEntropy {
-    fn fill(&mut self, buf: &mut [u8]) {
-        let mut x: u8 = 0x5a;
-        for b in buf.iter_mut() {
-            x = x.wrapping_mul(17).wrapping_add(1);
-            *b = x;
-        }
-    }
-    fn origin(&self) -> EntropyOrigin { EntropyOrigin::ReeHost }
-}
-
 pub struct VirtHuk { bytes: [u8; 32] }
 impl Huk for VirtHuk {
     fn material(&self) -> &[u8] { &self.bytes }
@@ -341,9 +331,22 @@ impl VirtHal {
         Ok(())
     }
 
-    /// Bind guest CID 3 port 7007. Host rustee-virt.ko connects after this.
+    /// Bind guest CID 3 port 7007. Called from `Hal::init` (boot). Host rustee-virt.ko connects after this.
     pub fn listen_vsock(&mut self) {
         self.listener.listen();
+    }
+
+    pub fn vsock_bound(&self) -> Option<(u32, u32)> {
+        if self.listener.is_listening() {
+            Some((self.listener.cid, self.listener.port))
+        } else {
+            None
+        }
+    }
+
+    /// virtio-rng used buffer. Live QEMU path; tests may call this too.
+    pub fn feed_rng(&mut self, bytes: &[u8]) {
+        self.entropy.complete(bytes);
     }
 
     /// virtio-vsock REQUEST -> RESPONSE. One SOCK_STREAM.
@@ -424,10 +427,14 @@ impl Hal for VirtHal {
             },
             bounce: info.shm_pool,
             bounce_mem: Vec::new(),
-            entropy: VirtEntropy,
+            entropy: VirtEntropy::new(),
             huk: VirtHuk { bytes: *b"RUSTEE-VIRT-DEV-HUK-NOT-SECRET!!" },
             shms: [(); 32].map(|_| None),
-            listener: VsockListener::default(),
+            listener: {
+                let mut l = VsockListener::default();
+                l.listen();
+                l
+            },
             conn: None,
         })
     }
@@ -546,6 +553,18 @@ mod tests {
         h.entropy().fill(&mut buf);
         assert!(buf.iter().any(|b| *b != 0));
         assert_eq!(h.entropy().origin(), EntropyOrigin::ReeHost);
+        assert_eq!(VIRTIO_ID_RNG, 4);
+        assert_eq!(VIRTIO_PCI_DEVICE_RNG, 0x1044);
+        h.feed_rng(&[0u8; 16]);
+        let mut z = [0u8; 16];
+        h.entropy().fill(&mut z);
+        assert!(z.iter().any(|b| *b != 0));
+    }
+
+    #[test]
+    fn boot_binds_cid3_port7007() {
+        let h = VirtHal::new();
+        assert_eq!(h.vsock_bound(), Some((3, 7007)));
     }
 
     #[test]
