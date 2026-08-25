@@ -5,7 +5,27 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "RUSTEE CryptoProvider and Arithmetical API math. No TEE_* names."
 
 [features]
 default = ["arith"]
 arith = []
+allow-ree-entropy = []
+allow-ree-huk = []
+
+[dependencies]
+rustee-hal = { workspace = true }
+aes = { version = "0.8", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+digest = { version = "0.10", default-features = false }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
+hkdf = { version = "0.12", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
+rand_core = { version = "0.6", default-features = false }
+
+[dev-dependencies]
+# tests run as std
