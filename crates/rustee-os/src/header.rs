@@ -9,9 +9,10 @@ pub const RTSG_MAGIC: u32 = 0x4753_5452; // 'RTSG' LE
 pub const RTSG_ABI: u16 = 0;
 pub const SECTION_NAME: &str = ".rustee.ta_head";
 
-/// Compiled-in v0 development public key. CryptoProvider verifies; rustee-os
-/// does not implement RSA. Placeholder 32-byte id until rustee-crypto ships the real key.
-pub static V0_DEV_PUBKEY: &[u8] = b"RUSTEE-V0-DEV-PUBKEY-PLACEHOLDER!";
+/// Compiled-in v0 development SPKI public key (RSA-2048).
+/// CryptoProvider verifies; rustee-os does not implement RSA.
+/// Matching private key: `crates/rustee-os/dev-keys/v0-dev.pem` (signer, not TCB).
+pub static V0_DEV_PUBKEY: &[u8] = include_bytes!("../dev-keys/v0-dev.spki.der");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaProperties {
