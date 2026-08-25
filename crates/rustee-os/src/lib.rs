@@ -59,6 +59,8 @@ pub struct Kernel<H: Hal, C: CryptoProvider = rustee_crypto::SoftwareProvider> {
     early: EarlyTas,
     yielding: Option<Yielding>,
     current_instance: Option<InstanceId>,
+    current_pta: bool,
+    notices_ok: bool,
     cancelled: alloc::vec::Vec<u32>,
     _h: core::marker::PhantomData<H>,
 }
@@ -74,6 +76,8 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             early: EarlyTas::new(),
             yielding: None,
             current_instance: None,
+            current_pta: false,
+            notices_ok: entropy_origin != EntropyOrigin::ReeHost,
             cancelled: alloc::vec::Vec::new(),
             _h: core::marker::PhantomData,
         }
@@ -82,16 +86,19 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
     /// HAL has no console. If entropy is ReeHost, write HAL notices (or fallbacks).
     /// Must not continue silently.
     pub fn emit_ree_notices<W: core::fmt::Write>(
-        &self,
+        &mut self,
         out: &mut W,
         notices: Option<[&str; 2]>,
     ) -> core::fmt::Result {
         if self.entropy_origin != EntropyOrigin::ReeHost {
+            self.notices_ok = true;
             return Ok(());
         }
         let n = notices.unwrap_or([VIRT_ENTROPY_NOTICE, VIRT_HUK_NOTICE]);
         writeln!(out, "{}", n[0])?;
-        writeln!(out, "{}", n[1])
+        writeln!(out, "{}", n[1])?;
+        self.notices_ok = true;
+        Ok(())
     }
 
     pub fn register_pta(&mut self, pta: alloc::boxed::Box<dyn Pta>) {
@@ -103,6 +110,9 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
     }
 
     pub fn handle(&mut self, cmd: KernelCmd) -> KernelOut {
+        if !self.notices_ok {
+            return KernelOut::done_err(TEE_ERROR_SECURITY);
+        }
         match cmd {
             KernelCmd::OpenSession {
                 uuid,
@@ -130,6 +140,23 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         }
     }
 
+    /// Panic in the current call. PTA panics halt the kernel; TA panics
+    /// poison that instance only (TARGET_DEAD).
+    pub fn on_panic(&mut self) -> KernelOut {
+        if self.current_pta {
+            self.halt_kernel();
+        }
+        self.on_ta_panic()
+    }
+
+    fn halt_kernel(&self) -> ! {
+        let _ = self;
+        #[cfg(test)]
+        panic!("PTA panic: kernel halt");
+        #[cfg(not(test))]
+        loop {}
+    }
+
     /// TA panic: poison that instance and its sessions only. Returns TARGET_DEAD.
     pub fn on_ta_panic(&mut self) -> KernelOut {
         if let Some(id) = self.current_instance.take() {
@@ -146,6 +173,24 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
 
     fn cancelled(&self, cancel_id: u32) -> bool {
         self.cancelled.iter().any(|&c| c == cancel_id)
+    }
+
+    fn lock_instance(&mut self, iid: InstanceId) -> Result<(), u32> {
+        let inst = self
+            .instances
+            .get_mut(iid)
+            .ok_or(TEE_ERROR_TARGET_DEAD)?;
+        if inst.busy {
+            return Err(TEE_ERROR_BUSY);
+        }
+        inst.busy = true;
+        Ok(())
+    }
+
+    fn unlock_instance(&mut self, iid: InstanceId) {
+        if let Some(inst) = self.instances.get_mut(iid) {
+            inst.busy = false;
+        }
     }
 
     fn open(
@@ -210,7 +255,12 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                 let _ = timeout_ms;
                 return KernelOut::done_err(TEE_ERROR_BUSY);
             }
-            return self.bind_session(id, uuid, login, params);
+            if let Err(e) = self.lock_instance(id) {
+                return KernelOut::done_err(e);
+            }
+            let out = self.bind_session(id, uuid, login, params);
+            self.unlock_instance(id);
+            return out;
         }
         if let Some(early) = self.early.get(uuid).cloned() {
             return self.instantiate_and_bind(early.props, uuid, login, params, early.entries);
@@ -247,15 +297,21 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             session_count: 0,
             state: InstanceState::Live,
             entries,
+            busy: false,
         };
         let Some(iid) = self.instances.alloc(inst) else {
             return KernelOut::done_err(TEE_ERROR_OUT_OF_MEMORY);
         };
+        if let Err(e) = self.lock_instance(iid) {
+            self.instances.drop_id(iid);
+            return KernelOut::done_err(e);
+        }
         if let Some(ep) = entries {
             self.current_instance = Some(iid);
             let code = unsafe { (ep.create)() };
             self.current_instance = None;
             if code != TEE_SUCCESS {
+                self.unlock_instance(iid);
                 self.instances.drop_id(iid);
                 return KernelOut::Done {
                     result: TeeResult::ta(code),
@@ -264,7 +320,9 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                 };
             }
         }
-        self.bind_session(iid, uuid, login, params)
+        let out = self.bind_session(iid, uuid, login, params);
+        self.unlock_instance(iid);
+        out
     }
 
     fn bind_session(
@@ -333,7 +391,9 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         match sess.kind {
             SessionKind::Pta => {
                 if let Some(pta) = self.ptas.get_mut(sess.uuid) {
+                    self.current_pta = true;
                     let r = pta.invoke(sess.ta_sess_ctx, cmd_id, &mut params);
+                    self.current_pta = false;
                     KernelOut::Done {
                         result: r,
                         session: Some(session),
@@ -347,10 +407,14 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                 // REE memrefs: register → sync_in → map_into → invoke → sync_out
                 // is HAL SharedMem. EXEC+SHM is illegal (rejected when mapping).
                 // TA-to-TA MemrefSrc::Ta skips the bounce pool; VA is the TA buffer.
-                self.current_instance = sess.instance;
-                let entries = sess
-                    .instance
-                    .and_then(|id| self.instances.get(id).and_then(|i| i.entries));
+                let Some(iid) = sess.instance else {
+                    return KernelOut::done_err(TEE_ERROR_TARGET_DEAD);
+                };
+                if let Err(e) = self.lock_instance(iid) {
+                    return KernelOut::done_err(e);
+                }
+                self.current_instance = Some(iid);
+                let entries = self.instances.get(iid).and_then(|i| i.entries);
                 let out = if let Some(ep) = entries {
                     let types = param_types_of(&params);
                     let mut raw = params_to_raw(&params);
@@ -373,6 +437,7 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                     }
                 };
                 self.current_instance = None;
+                self.unlock_instance(iid);
                 out
             }
         }
@@ -390,26 +455,36 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             }
             SessionKind::UserTa => {
                 if let Some(iid) = sess.instance {
+                    if let Err(e) = self.lock_instance(iid) {
+                        return KernelOut::done_err(e);
+                    }
                     let entries = self.instances.get(iid).and_then(|i| i.entries);
                     if let Some(ep) = entries {
                         self.current_instance = Some(iid);
                         unsafe { (ep.close_session)(sess.ta_sess_ctx) };
                         self.current_instance = None;
                     }
-                    if let Some(inst) = self.instances.get_mut(iid) {
+                    let drop_inst = if let Some(inst) = self.instances.get_mut(iid) {
                         inst.session_count = inst.session_count.saturating_sub(1);
-                        if inst.session_count == 0 && !inst.props.instance_keep_alive {
-                            if let Some(ep) = inst.entries {
-                                self.current_instance = Some(iid);
-                                unsafe { (ep.destroy)() };
-                                self.current_instance = None;
-                            }
+                        inst.session_count == 0 && !inst.props.instance_keep_alive
+                    } else {
+                        false
+                    };
+                    if drop_inst {
+                        if let Some(ep) = self.instances.get(iid).and_then(|i| i.entries) {
+                            self.current_instance = Some(iid);
+                            unsafe { (ep.destroy)() };
+                            self.current_instance = None;
+                        }
+                        if let Some(inst) = self.instances.get_mut(iid) {
                             inst.state = InstanceState::Dead;
                             if let Some(mut aspace) = inst.aspace.take() {
                                 aspace.drop_all();
                             }
-                            self.instances.drop_id(iid);
                         }
+                        self.instances.drop_id(iid);
+                    } else {
+                        self.unlock_instance(iid);
                     }
                 }
             }
@@ -604,7 +679,7 @@ mod tests {
     }
 
     fn k() -> Kernel<MockHal, SoftwareProvider> {
-        Kernel::new(SoftwareProvider, EntropyOrigin::ReeHost)
+        Kernel::new(SoftwareProvider, EntropyOrigin::Isolated)
     }
 
     fn none_params() -> [Param; PARAM_COUNT] {
@@ -613,11 +688,22 @@ mod tests {
 
     #[test]
     fn ree_notices_printed() {
-        let k = k();
+        let mut k = Kernel::<MockHal, SoftwareProvider>::new(
+            SoftwareProvider,
+            EntropyOrigin::ReeHost,
+        );
+        match k.handle(KernelCmd::Cancel { cancel_id: 1 }) {
+            KernelOut::Done { result, .. } => assert_eq!(result.code, TEE_ERROR_SECURITY),
+            _ => panic!(),
+        }
         let mut s = alloc::string::String::new();
         k.emit_ree_notices(&mut s, None).unwrap();
         assert!(s.contains("not a product TEE RNG"));
         assert!(s.contains("not a product HUK"));
+        match k.handle(KernelCmd::Cancel { cancel_id: 1 }) {
+            KernelOut::Done { result, .. } => assert_eq!(result.code, TEE_SUCCESS),
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -1144,5 +1230,31 @@ mod tests {
         assert_eq!(s.open_session, 0x120);
         assert_eq!(s.close_session, 0x130);
         assert_eq!(s.invoke, 0x140);
+    }
+
+    #[test]
+    #[should_panic(expected = "PTA panic: kernel halt")]
+    fn pta_panic_halts() {
+        let mut k = k();
+        k.current_pta = true;
+        let _ = k.on_panic();
+    }
+
+    #[test]
+    fn instance_serialize_busy() {
+        let mut k = hello_kernel();
+        let sid = open_hello(&mut k);
+        let iid = k.sessions.get(sid).and_then(|s| s.instance).unwrap();
+        k.instances.get_mut(iid).unwrap().busy = true;
+        match k.handle(KernelCmd::Invoke {
+            session: sid,
+            cmd_id: 0,
+            params: none_params(),
+            cancel_id: 9,
+            timeout_ms: TEE_TIMEOUT_INFINITE,
+        }) {
+            KernelOut::Done { result, .. } => assert_eq!(result.code, TEE_ERROR_BUSY),
+            other => panic!("{other:?}"),
+        }
     }
 }

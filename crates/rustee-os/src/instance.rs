@@ -19,6 +19,7 @@ pub struct Instance<H: Hal> {
     pub session_count: u16,
     pub state: InstanceState,
     pub entries: Option<TaEntryPoints>,
+    pub busy: bool,
 }
 
 pub struct InstanceTable<H: Hal> {
