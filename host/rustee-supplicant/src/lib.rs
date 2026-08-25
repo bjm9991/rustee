@@ -65,6 +65,12 @@ impl Supplicant {
         match op {
             RPC_FS_OPEN | RPC_FS_CREATE => {
                 let p = Self::safe(&self.root, name)?;
+                // No mkdir opcode. CREATE of {uuid}/obj/{file_id} must mkdir -p.
+                if op == RPC_FS_CREATE {
+                    if let Some(parent) = p.parent() {
+                        fs::create_dir_all(parent).map_err(|_| SuppError::Io)?;
+                    }
+                }
                 let f = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -164,13 +170,39 @@ impl Supplicant {
                 let op = params[0].a as u32;
                 let fd = params[0].b as u32;
                 let off = params[0].c as u32;
-                self.fs(op, "", fd, off, &[])?;
+                let name = Self::name_from_tmem(bounce, &params, n);
+                let (out_fd, _) = self.fs(op, &name, fd, off, &[])?;
+                if op == RPC_FS_CREATE || op == RPC_FS_OPEN {
+                    params[0].b = out_fd as u64;
+                }
             }
             _ => return Err(SuppError::BadCmd),
         }
         rustee_proto::write_msg(bounce, cookie, hdr, &params[..n]).map_err(|_| SuppError::Io)?;
         Ok(())
     }
+
+
+    fn name_from_tmem(bounce: &[u8], params: &[rustee_proto::MsgParam], n: usize) -> String {
+    if n < 2 {
+        return String::new();
+    }
+    let attr = params[1].attr & rustee_proto::ATTR_TYPE_MASK;
+    match attr {
+        rustee_proto::ATTR_TYPE_TMEM_INPUT
+        | rustee_proto::ATTR_TYPE_TMEM_INOUT
+        | rustee_proto::ATTR_TYPE_TMEM_OUTPUT => {}
+        _ => return String::new(),
+    }
+    let off = params[1].a as usize;
+    let sz = params[1].b as usize;
+    if off.checked_add(sz).map(|e| e > bounce.len()).unwrap_or(true) {
+        return String::new();
+    }
+    let bytes = &bounce[off..off + sz];
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
 
     pub fn rpc_cmd(cmd: u32) -> Result<(), SuppError> {
         match cmd {
@@ -216,6 +248,19 @@ mod tests {
         s.handle_msg(&mut bounce, 0).unwrap();
         let (_, params, _) = decode_msg(&bounce, 0).unwrap();
         assert!(params[0].a > 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn create_mkdirs_uuid_obj() {
+        let dir = env::temp_dir().join("rustee-supp-mkdir");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Supplicant::new(dir.clone()).unwrap();
+        let path = "aabbccddeeff00112233445566778899/obj/00112233445566778899aabbccddeeff";
+        let (fd, _) = s.fs(RPC_FS_CREATE, path, 0, 0, &[]).unwrap();
+        s.fs(RPC_FS_WRITE, "", fd, 0, b"x").unwrap();
+        s.fs(RPC_FS_CLOSE, "", fd, 0, &[]).unwrap();
+        assert!(dir.join(path).is_file());
         let _ = fs::remove_dir_all(dir);
     }
 }
