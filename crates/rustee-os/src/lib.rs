@@ -26,9 +26,10 @@ pub use pta::{Pta, PtaRegistry};
 
 use header::encode_ta_head as encode_head;
 use instance::{Instance, InstanceState, InstanceTable};
+use elf::map_elf;
 use loader::{EarlyTas, Loaded};
 use rustee_crypto::CryptoProvider;
-use rustee_hal::{EntropyOrigin, Hal, TaAddressSpace};
+use rustee_hal::{AddressSpace, Entropy, EntropyOrigin, Hal, Perms, SharedMem, VirtAddr};
 use session::{Session, SessionKind, SessionState, SessionTable};
 
 const MAX_SESSIONS: usize = 32;
@@ -62,11 +63,12 @@ pub struct Kernel<H: Hal, C: CryptoProvider = rustee_crypto::SoftwareProvider> {
     current_pta: bool,
     notices_ok: bool,
     cancelled: alloc::vec::Vec<u32>,
-    _h: core::marker::PhantomData<H>,
+    hal: H,
 }
 
 impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
-    pub fn new(crypto: C, entropy_origin: EntropyOrigin) -> Self {
+    pub fn new(mut hal: H, crypto: C) -> Self {
+        let entropy_origin = hal.entropy().origin();
         Self {
             crypto,
             entropy_origin,
@@ -79,8 +81,12 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             current_pta: false,
             notices_ok: entropy_origin != EntropyOrigin::ReeHost,
             cancelled: alloc::vec::Vec::new(),
-            _h: core::marker::PhantomData,
+            hal,
         }
+    }
+
+    pub fn hal_mut(&mut self) -> &mut H {
+        &mut self.hal
     }
 
     /// HAL has no console. If entropy is ReeHost, write HAL notices (or fallbacks).
@@ -193,6 +199,89 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         }
     }
 
+    fn dir_perms(dir: Dir) -> Perms {
+        match dir {
+            Dir::In => Perms::READ,
+            Dir::Out => Perms::WRITE,
+            Dir::InOut => Perms::RW,
+        }
+    }
+
+    fn map_params(
+        &mut self,
+        iid: InstanceId,
+        params: &[Param; PARAM_COUNT],
+    ) -> Result<([ParamRaw; PARAM_COUNT], [Option<u64>; PARAM_COUNT]), u32> {
+        let mut raw = params_to_raw(params);
+        let mut vas = [None; PARAM_COUNT];
+        let mut aspace = self
+            .instances
+            .get_mut(iid)
+            .and_then(|i| i.aspace.take())
+            .ok_or(TEE_ERROR_TARGET_DEAD)?;
+        for i in 0..PARAM_COUNT {
+            let Param::Memref {
+                src: MemrefSrc::Ree { cookie, offs },
+                size,
+                dir,
+            } = params[i]
+            else {
+                continue;
+            };
+            let perms = Self::dir_perms(dir);
+            if dir != Dir::Out {
+                let shm = self.hal.lookup_shm_mut(cookie).ok_or(TEE_ERROR_BAD_PARAMETERS)?;
+                shm.sync_in().map_err(|_| TEE_ERROR_BAD_PARAMETERS)?;
+            }
+            let shm = self.hal.lookup_shm(cookie).ok_or(TEE_ERROR_BAD_PARAMETERS)?;
+            if shm.len() < offs.saturating_add(size) {
+                self.instances.get_mut(iid).unwrap().aspace = Some(aspace);
+                return Err(TEE_ERROR_BAD_PARAMETERS);
+            }
+            let va = shm
+                .map_into(&mut aspace, perms)
+                .map_err(|_| TEE_ERROR_BAD_PARAMETERS)?;
+            let ptr = (va.0 as usize).wrapping_add(offs);
+            raw[i] = ParamRaw {
+                memref: MemrefRaw {
+                    buffer: ptr as *mut u8,
+                    size,
+                },
+            };
+            vas[i] = Some(va.0);
+        }
+        self.instances.get_mut(iid).unwrap().aspace = Some(aspace);
+        Ok((raw, vas))
+    }
+
+    fn unmap_params(
+        &mut self,
+        iid: InstanceId,
+        params: &[Param; PARAM_COUNT],
+        vas: &[Option<u64>; PARAM_COUNT],
+    ) {
+        for i in 0..PARAM_COUNT {
+            let Param::Memref {
+                src: MemrefSrc::Ree { cookie, .. },
+                dir,
+                ..
+            } = params[i]
+            else {
+                continue;
+            };
+            if dir != Dir::In {
+                if let Some(shm) = self.hal.lookup_shm_mut(cookie) {
+                    let _ = shm.sync_out();
+                }
+            }
+            if let Some(va) = vas[i] {
+                if let Some(aspace) = self.instances.get_mut(iid).and_then(|i| i.aspace.as_mut()) {
+                    aspace.unmap(VirtAddr(va));
+                }
+            }
+        }
+    }
+
     fn open(
         &mut self,
         uuid: Uuid,
@@ -263,7 +352,7 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             return out;
         }
         if let Some(early) = self.early.get(uuid).cloned() {
-            return self.instantiate_and_bind(early.props, uuid, login, params, early.entries);
+            return self.instantiate_and_bind(early.props, uuid, login, params, early.entries, None);
         }
         if self.yielding.is_some() {
             return KernelOut::done_err(TEE_ERROR_BUSY);
@@ -285,15 +374,17 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         login: Login,
         params: [Param; PARAM_COUNT],
         entries: Option<TaEntryPoints>,
+        aspace: Option<H::AddressSpace>,
     ) -> KernelOut {
         if props.uuid != uuid {
             return KernelOut::done_err(TEE_ERROR_SECURITY);
         }
+        let aspace = aspace.unwrap_or_else(|| self.hal.new_address_space());
         let inst = Instance::<H> {
             id: InstanceId(0),
             uuid,
             props,
-            aspace: None,
+            aspace: Some(aspace),
             session_count: 0,
             state: InstanceState::Live,
             entries,
@@ -335,11 +426,15 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         let mut ctx = 0usize;
         if let Some(ep) = self.instances.get(iid).and_then(|i| i.entries) {
             let types = param_types_of(&params);
-            let mut raw = params_to_raw(&params);
+            let (mut raw, vas) = match self.map_params(iid, &params) {
+                Ok(v) => v,
+                Err(e) => return KernelOut::done_err(e),
+            };
             self.current_instance = Some(iid);
             let code = unsafe { (ep.open_session)(types, raw.as_mut_ptr(), &mut ctx) };
             self.current_instance = None;
             params_from_raw(&mut params, &raw);
+            self.unmap_params(iid, &params, &vas);
             if code != TEE_SUCCESS {
                 return KernelOut::Done {
                     result: TeeResult::ta(code),
@@ -414,26 +509,28 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                     return KernelOut::done_err(e);
                 }
                 self.current_instance = Some(iid);
-                let entries = self.instances.get(iid).and_then(|i| i.entries);
-                let out = if let Some(ep) = entries {
-                    let types = param_types_of(&params);
-                    let mut raw = params_to_raw(&params);
-                    let code = unsafe { (ep.invoke)(sess.ta_sess_ctx, cmd_id, types, raw.as_mut_ptr()) };
-                    params_from_raw(&mut params, &raw);
-                    KernelOut::Done {
-                        result: if code == TEE_SUCCESS {
-                            TeeResult::ok()
+                let mapped = self.map_params(iid, &params);
+                let out = match mapped {
+                    Err(e) => KernelOut::done_err(e),
+                    Ok((mut raw, vas)) => {
+                        let entries = self.instances.get(iid).and_then(|i| i.entries);
+                        let types = param_types_of(&params);
+                        let code = if let Some(ep) = entries {
+                            unsafe { (ep.invoke)(sess.ta_sess_ctx, cmd_id, types, raw.as_mut_ptr()) }
                         } else {
-                            TeeResult::ta(code)
-                        },
-                        session: Some(session),
-                        params,
-                    }
-                } else {
-                    KernelOut::Done {
-                        result: TeeResult::ok(),
-                        session: Some(session),
-                        params,
+                            TEE_SUCCESS
+                        };
+                        params_from_raw(&mut params, &raw);
+                        self.unmap_params(iid, &params, &vas);
+                        KernelOut::Done {
+                            result: if code == TEE_SUCCESS {
+                                TeeResult::ok()
+                            } else {
+                                TeeResult::ta(code)
+                            },
+                            session: Some(session),
+                            params,
+                        }
                     }
                 };
                 self.current_instance = None;
@@ -520,7 +617,16 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                         if props.uuid != uuid {
                             KernelOut::done_err(TEE_ERROR_SECURITY)
                         } else {
-                            self.instantiate_and_bind(props, uuid, login, params, None)
+                            let mut aspace = self.hal.new_address_space();
+                            let entries = map_elf(&mut aspace, &bytes).ok().flatten();
+                            self.instantiate_and_bind(
+                                props,
+                                uuid,
+                                login,
+                                params,
+                                entries,
+                                Some(aspace),
+                            )
                         }
                     }
                     Err(code) => KernelOut::done_err(code),
@@ -575,13 +681,16 @@ mod tests {
         fn drop_all(&mut self) {}
     }
 
-    struct MockShm;
+    struct MockShm {
+        cookie: u64,
+        buf: alloc::vec::Vec<u8>,
+    }
     impl SharedMem for MockShm {
         fn cookie(&self) -> u64 {
-            0
+            self.cookie
         }
         fn len(&self) -> usize {
-            0
+            self.buf.len()
         }
         fn perms(&self) -> Perms {
             Perms::RW
@@ -593,17 +702,20 @@ mod tests {
             Ok(())
         }
         fn map_into(&self, aspace: &mut impl AddressSpace, perms: Perms) -> Result<VirtAddr, HalError> {
-            aspace.map_shm(self, perms)
+            aspace.map_shm(self, perms)?;
+            Ok(VirtAddr(self.buf.as_ptr() as u64))
         }
     }
 
-    struct MockEnt;
+    struct MockEnt {
+        origin: EntropyOrigin,
+    }
     impl Entropy for MockEnt {
         fn fill(&mut self, buf: &mut [u8]) {
             buf.fill(0);
         }
         fn origin(&self) -> EntropyOrigin {
-            EntropyOrigin::ReeHost
+            self.origin
         }
     }
     struct MockHuk;
@@ -613,7 +725,34 @@ mod tests {
         }
     }
 
-    struct MockHal;
+    struct MockHal {
+        gate: MockGate,
+        ent: MockEnt,
+        huk: MockHuk,
+        shms: alloc::vec::Vec<MockShm>,
+    }
+    impl MockHal {
+        fn isolated() -> Self {
+            Self {
+                gate: MockGate,
+                ent: MockEnt {
+                    origin: EntropyOrigin::Isolated,
+                },
+                huk: MockHuk,
+                shms: alloc::vec::Vec::new(),
+            }
+        }
+        fn ree() -> Self {
+            Self {
+                gate: MockGate,
+                ent: MockEnt {
+                    origin: EntropyOrigin::ReeHost,
+                },
+                huk: MockHuk,
+                shms: alloc::vec::Vec::new(),
+            }
+        }
+    }
     impl Hal for MockHal {
         type CallGate = MockGate;
         type AddressSpace = MockAs;
@@ -625,13 +764,13 @@ mod tests {
         type Irq = Unsupported;
 
         fn call_gate(&mut self) -> &mut Self::CallGate {
-            unimplemented!()
+            &mut self.gate
         }
         fn entropy(&mut self) -> &mut Self::Entropy {
-            unimplemented!()
+            &mut self.ent
         }
         fn huk(&self) -> &Self::Huk {
-            unimplemented!()
+            &self.huk
         }
         fn monotonic(&mut self) -> Option<&mut Self::Monotonic> {
             None
@@ -643,16 +782,16 @@ mod tests {
             None
         }
         fn init(_: BootInfo) -> Result<Self, HalError> {
-            Ok(MockHal)
+            Ok(Self::isolated())
         }
         fn new_address_space(&mut self) -> Self::AddressSpace {
             MockAs
         }
-        fn lookup_shm(&self, _: u64) -> Option<&Self::SharedMem> {
-            None
+        fn lookup_shm(&self, cookie: u64) -> Option<&Self::SharedMem> {
+            self.shms.iter().find(|s| s.cookie == cookie)
         }
-        fn lookup_shm_mut(&mut self, _: u64) -> Option<&mut Self::SharedMem> {
-            None
+        fn lookup_shm_mut(&mut self, cookie: u64) -> Option<&mut Self::SharedMem> {
+            self.shms.iter_mut().find(|s| s.cookie == cookie)
         }
     }
 
@@ -679,7 +818,7 @@ mod tests {
     }
 
     fn k() -> Kernel<MockHal, SoftwareProvider> {
-        Kernel::new(SoftwareProvider, EntropyOrigin::Isolated)
+        Kernel::new(MockHal::isolated(), SoftwareProvider)
     }
 
     fn none_params() -> [Param; PARAM_COUNT] {
@@ -688,10 +827,7 @@ mod tests {
 
     #[test]
     fn ree_notices_printed() {
-        let mut k = Kernel::<MockHal, SoftwareProvider>::new(
-            SoftwareProvider,
-            EntropyOrigin::ReeHost,
-        );
+        let mut k = Kernel::<MockHal, SoftwareProvider>::new(MockHal::ree(), SoftwareProvider);
         match k.handle(KernelCmd::Cancel { cancel_id: 1 }) {
             KernelOut::Done { result, .. } => assert_eq!(result.code, TEE_ERROR_SECURITY),
             _ => panic!(),
@@ -998,8 +1134,9 @@ mod tests {
     fn exec_plus_shm_illegal() {
         let mut aspace = MockAs;
         let exec = Perms { read: true, write: false, exec: true };
-        assert!(aspace.map_shm(&MockShm, exec).is_err());
-        assert!(aspace.map_shm(&MockShm, Perms::RW).is_ok());
+        let shm = MockShm { cookie: 0, buf: alloc::vec![0u8; 8] };
+        assert!(aspace.map_shm(&shm, exec).is_err());
+        assert!(aspace.map_shm(&shm, Perms::RW).is_ok());
     }
 
     #[test]
@@ -1254,6 +1391,51 @@ mod tests {
             timeout_ms: TEE_TIMEOUT_INFINITE,
         }) {
             KernelOut::Done { result, .. } => assert_eq!(result.code, TEE_ERROR_BUSY),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_cmd0_ree_memref_map_into() {
+        let mut k = hello_kernel();
+        k.hal_mut().shms.push(MockShm {
+            cookie: 1,
+            buf: b"hello-rs".to_vec(),
+        });
+        k.hal_mut().shms.push(MockShm {
+            cookie: 2,
+            buf: alloc::vec![0u8; 16],
+        });
+        let sid = open_hello(&mut k);
+        let params = [
+            Param::Memref {
+                src: MemrefSrc::Ree { cookie: 1, offs: 0 },
+                size: 8,
+                dir: Dir::In,
+            },
+            Param::Memref {
+                src: MemrefSrc::Ree { cookie: 2, offs: 0 },
+                size: 16,
+                dir: Dir::Out,
+            },
+            Param::None,
+            Param::None,
+        ];
+        match k.handle(KernelCmd::Invoke {
+            session: sid,
+            cmd_id: 0,
+            params,
+            cancel_id: 4,
+            timeout_ms: TEE_TIMEOUT_INFINITE,
+        }) {
+            KernelOut::Done { result, params, .. } => {
+                assert_eq!(result.code, TEE_SUCCESS);
+                assert_eq!(&k.hal_mut().shms[1].buf[..8], b"hello-rs");
+                match params[1] {
+                    Param::Memref { size, .. } => assert_eq!(size, 8),
+                    _ => panic!(),
+                }
+            }
             other => panic!("{other:?}"),
         }
     }
