@@ -129,6 +129,49 @@ impl Supplicant {
         }
     }
 
+
+    /// Decode RPC MSG at cookie and fill outputs in bounce. GET_TIME / LOAD_TA / FS.
+    pub fn handle_msg(&mut self, bounce: &mut [u8], cookie: u64) -> Result<(), SuppError> {
+        let (hdr, mut params, _) = rustee_proto::decode_msg(bounce, cookie).map_err(|_| SuppError::BadCmd)?;
+        let n = hdr.num_params as usize;
+        match hdr.cmd {
+            RPC_CMD_GET_TIME => {
+                if n < 1 {
+                    return Err(SuppError::BadCmd);
+                }
+                let (sec, ns) = self.get_time();
+                params[0].a = sec as u64;
+                params[0].b = ns as u64;
+            }
+            RPC_CMD_LOAD_TA => {
+                if n < 1 {
+                    return Err(SuppError::BadCmd);
+                }
+                let uuid = format!("{:016x}{:016x}", params[0].a, params[0].b);
+                match self.load_ta(&uuid) {
+                    Ok(bytes) => {
+                        if n >= 2 {
+                            params[1].b = bytes.len() as u64;
+                        }
+                    }
+                    Err(_) => return Err(SuppError::NotFound),
+                }
+            }
+            RPC_CMD_FS => {
+                if n < 1 {
+                    return Err(SuppError::BadCmd);
+                }
+                let op = params[0].a as u32;
+                let fd = params[0].b as u32;
+                let off = params[0].c as u32;
+                self.fs(op, "", fd, off, &[])?;
+            }
+            _ => return Err(SuppError::BadCmd),
+        }
+        rustee_proto::write_msg(bounce, cookie, hdr, &params[..n]).map_err(|_| SuppError::Io)?;
+        Ok(())
+    }
+
     pub fn rpc_cmd(cmd: u32) -> Result<(), SuppError> {
         match cmd {
             RPC_CMD_LOAD_TA | RPC_CMD_GET_TIME | RPC_CMD_FS => Ok(()),
@@ -155,6 +198,24 @@ mod tests {
         let (_n, data) = s.fs(RPC_FS_READ, "", fd, 0, &[0; 8]).unwrap();
         assert_eq!(&data, b"abc");
         s.fs(RPC_FS_CLOSE, "", fd, 0, &[]).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_gettime_writes_secs() {
+        use rustee_proto::{decode_msg, write_msg, MsgArgHdr, MsgParam};
+        let dir = env::temp_dir().join("rustee-supp-gettime");
+        let mut s = Supplicant::new(dir.clone()).unwrap();
+        let mut bounce = vec![0u8; 256];
+        let hdr = MsgArgHdr {
+            cmd: RPC_CMD_GET_TIME,
+            num_params: 1,
+            ..MsgArgHdr::default()
+        };
+        write_msg(&mut bounce, 0, hdr, &[MsgParam::default()]).unwrap();
+        s.handle_msg(&mut bounce, 0).unwrap();
+        let (_, params, _) = decode_msg(&bounce, 0).unwrap();
+        assert!(params[0].a > 0);
         let _ = fs::remove_dir_all(dir);
     }
 }

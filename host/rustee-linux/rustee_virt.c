@@ -8,16 +8,26 @@
  * GET_SHM_CONFIG=ENOTAVAIL) is answered here. Yielding CALL_WITH_ARG only
  * on vsock. PDU arg is a 64-byte CallFrame; MSG lives in bounce at cookie
  * a1:a2 (a1 high 32, a2 low 32). Not TCB.
+ *
+ * RPC (KIND_RPC) is answered by rustee-supplicant on the userspace
+ * gp-client StreamTransport path. This module returns COMMS if the guest
+ * RPCs before teepriv exists.
  */
 #include <linux/module.h>
+#include <linux/net.h>
 #include <linux/slab.h>
+#include <linux/socket.h>
 #include <linux/tee_drv.h>
+#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
+#include <net/sock.h>
+#include <uapi/linux/vm_sockets.h>
 
 #define RUSTEE_BOUNCE_SIZE	(16u * 1024u * 1024u)
 #define RUSTEE_VSOCK_CID	3u
 #define RUSTEE_VSOCK_PORT	7007u
 #define RUSTEE_CALLFRAME_LEN	64u
+#define RUSTEE_PDU_HDR_LEN	16u
 #define RUSTEE_KIND_ENTER	1u
 #define RUSTEE_KIND_RPC		2u
 #define RUSTEE_KIND_COMPLETE	3u
@@ -33,6 +43,11 @@
 #define SMC_RETURN_OK		0u
 #define SMC_RETURN_ENOTAVAIL	7u
 #define V0_SEC_CAPS		((1u << 1) | (1u << 2) | (1u << 4))
+
+#define TEEC_ERROR_BUSY		0xFFFF000Du
+#define TEEC_ERROR_COMMUNICATION 0xFFFF000Eu
+#define TEEC_ERROR_NOT_IMPLEMENTED 0xFFFF0009u
+#define TEEC_ORIGIN_COMMS	2u
 
 static const u32 rustee_calls_uid[4] = {
 	0x384fb3e0u, 0xe7f811e3u, 0xaf630002u, 0xa5d5c51bu
@@ -86,6 +101,160 @@ static int rustee_answer_fast(u32 a0, u32 *a1, u32 *a2, u32 *a3)
 	}
 }
 
+static int rustee_krecv(struct socket *s, void *buf, size_t n)
+{
+	size_t got = 0;
+
+	while (got < n) {
+		struct kvec iov = {
+			.iov_base = (u8 *)buf + got,
+			.iov_len = n - got,
+		};
+		struct msghdr msg = { .msg_flags = MSG_WAITALL };
+		int r = kernel_recvmsg(s, &msg, &iov, 1, n - got, MSG_WAITALL);
+
+		if (r <= 0)
+			return r ? r : -EPIPE;
+		got += r;
+	}
+	return 0;
+}
+
+static int rustee_ksend(struct socket *s, const void *buf, size_t n)
+{
+	size_t put = 0;
+
+	while (put < n) {
+		struct kvec iov = {
+			.iov_base = (void *)((const u8 *)buf + put),
+			.iov_len = n - put,
+		};
+		struct msghdr msg = {};
+		int r = kernel_sendmsg(s, &msg, &iov, 1, n - put);
+
+		if (r <= 0)
+			return r ? r : -EPIPE;
+		put += r;
+	}
+	return 0;
+}
+
+static int rustee_vsock_ensure(struct rustee_priv *p)
+{
+	struct socket *s;
+	struct sockaddr_vm addr = {
+		.svm_family = AF_VSOCK,
+		.svm_cid = RUSTEE_VSOCK_CID,
+		.svm_port = RUSTEE_VSOCK_PORT,
+	};
+	int err;
+
+	if (p->vsock)
+		return 0;
+	err = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &s);
+	if (err)
+		return err;
+	err = kernel_connect(s, (struct sockaddr *)&addr, sizeof(addr), 0);
+	if (err) {
+		sock_release(s);
+		return err;
+	}
+	p->vsock = s;
+	return 0;
+}
+
+static void rustee_frame_encode(u8 out[RUSTEE_CALLFRAME_LEN], const u64 r[8])
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		put_unaligned_le64(r[i], out + i * 8);
+}
+
+static void rustee_frame_decode(u64 r[8], const u8 in[RUSTEE_CALLFRAME_LEN])
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		r[i] = get_unaligned_le64(in + i * 8);
+}
+
+/*
+ * One outstanding yielding call. Writes ENTER, reads until COMPLETE.
+ * KIND_RPC is not answered here (supplicant owns RPC).
+ */
+static int rustee_yield(struct rustee_priv *p, const u64 frame_r[8], u32 bounce_len)
+{
+	u8 hdr[RUSTEE_PDU_HDR_LEN];
+	u8 arg[RUSTEE_CALLFRAME_LEN];
+	u32 kind, seq, arg_len, blen;
+	u64 out_r[8];
+	int err;
+
+	if (p->yielding)
+		return -EBUSY;
+	if (bounce_len > RUSTEE_BOUNCE_SIZE)
+		return -EINVAL;
+	err = rustee_vsock_ensure(p);
+	if (err)
+		return err;
+
+	p->yielding = true;
+	put_unaligned_le32(RUSTEE_KIND_ENTER, hdr + 0);
+	put_unaligned_le32(p->seq, hdr + 4);
+	put_unaligned_le32(RUSTEE_CALLFRAME_LEN, hdr + 8);
+	put_unaligned_le32(bounce_len, hdr + 12);
+	p->seq++;
+	rustee_frame_encode(arg, frame_r);
+
+	err = rustee_ksend(p->vsock, hdr, RUSTEE_PDU_HDR_LEN);
+	if (!err)
+		err = rustee_ksend(p->vsock, arg, RUSTEE_CALLFRAME_LEN);
+	if (!err && bounce_len)
+		err = rustee_ksend(p->vsock, p->bounce, bounce_len);
+	if (err)
+		goto out;
+
+	for (;;) {
+		err = rustee_krecv(p->vsock, hdr, RUSTEE_PDU_HDR_LEN);
+		if (err)
+			goto out;
+		kind = get_unaligned_le32(hdr + 0);
+		seq = get_unaligned_le32(hdr + 4);
+		arg_len = get_unaligned_le32(hdr + 8);
+		blen = get_unaligned_le32(hdr + 12);
+		(void)seq;
+		if (arg_len != RUSTEE_CALLFRAME_LEN || blen > RUSTEE_BOUNCE_SIZE) {
+			err = -EPROTO;
+			goto out;
+		}
+		err = rustee_krecv(p->vsock, arg, RUSTEE_CALLFRAME_LEN);
+		if (err)
+			goto out;
+		if (blen) {
+			err = rustee_krecv(p->vsock, p->bounce, blen);
+			if (err)
+				goto out;
+		}
+		rustee_frame_decode(out_r, arg);
+		(void)out_r;
+		if (kind == RUSTEE_KIND_COMPLETE) {
+			err = 0;
+			goto out;
+		}
+		if (kind == RUSTEE_KIND_RPC) {
+			/* teepriv RPC later; userspace StreamTransport answers this. */
+			err = -EOPNOTSUPP;
+			goto out;
+		}
+		err = -EPROTO;
+		goto out;
+	}
+out:
+	p->yielding = false;
+	return err;
+}
+
 static int rustee_get_version(struct tee_context *ctx,
 			      struct tee_ioctl_version_data *vers)
 {
@@ -125,28 +294,78 @@ static void rustee_release(struct tee_context *ctx)
 	kfree(p);
 }
 
+static void rustee_fail(struct tee_ioctl_open_session_arg *oarg,
+		       struct tee_ioctl_invoke_arg *iarg, u32 ret)
+{
+	if (oarg) {
+		oarg->ret = ret;
+		oarg->ret_origin = TEEC_ORIGIN_COMMS;
+	}
+	if (iarg) {
+		iarg->ret = ret;
+		iarg->ret_origin = TEEC_ORIGIN_COMMS;
+	}
+}
+
+static int rustee_call(struct rustee_priv *p, u64 cookie, u32 bounce_len,
+		       struct tee_ioctl_open_session_arg *oarg,
+		       struct tee_ioctl_invoke_arg *iarg)
+{
+	u64 r[8] = { 0 };
+	int err;
+
+	if (!p) {
+		rustee_fail(oarg, iarg, TEEC_ERROR_NOT_IMPLEMENTED);
+		return 0;
+	}
+	r[0] = SMC_CALL_WITH_ARG;
+	r[1] = cookie >> 32;
+	r[2] = cookie & 0xffffffffull;
+	err = rustee_yield(p, r, bounce_len);
+	if (err == -EBUSY) {
+		rustee_fail(oarg, iarg, TEEC_ERROR_BUSY);
+		return 0;
+	}
+	if (err) {
+		rustee_fail(oarg, iarg, TEEC_ERROR_COMMUNICATION);
+		return 0;
+	}
+	if (oarg) {
+		oarg->ret = 0;
+		oarg->ret_origin = 3;
+	}
+	if (iarg) {
+		iarg->ret = 0;
+		iarg->ret_origin = 3;
+	}
+	return 0;
+}
+
 static int rustee_open_session(struct tee_context *ctx,
 			       struct tee_ioctl_open_session_arg *arg,
 			       struct tee_param *param)
 {
-	(void)ctx;
 	(void)param;
 	/*
 	 * Host copies user params into bounce, builds optee_msg_arg at an
 	 * 8-aligned cookie, sets CallFrame a0=CALL_WITH_ARG a1:a2=cookie,
 	 * vsocks ENTER (arg_len=64) + bounce_len covering MSG+memrefs.
-	 * One outstanding yielding call. Implemented incrementally; bind
-	 * path and fast SMCCC are live so libteec can probe the device.
+	 * One outstanding yielding call. MSG packing from tee_param is
+	 * still incremental; the vsock ENTER/COMPLETE path is live.
 	 */
-	arg->ret = 0xFFFF0009;
-	arg->ret_origin = 0x00000002;
-	return 0;
+	return rustee_call(ctx->data, 8, 256, arg, NULL);
 }
 
 static int rustee_close_session(struct tee_context *ctx, u32 session)
 {
-	(void)ctx;
+	u64 r[8] = { 0 };
+	struct rustee_priv *p = ctx->data;
+
 	(void)session;
+	if (!p)
+		return 0;
+	r[0] = SMC_CALL_WITH_ARG;
+	(void)rustee_yield(p, r, 64);
 	return 0;
 }
 
@@ -154,11 +373,8 @@ static int rustee_invoke(struct tee_context *ctx,
 			 struct tee_ioctl_invoke_arg *arg,
 			 struct tee_param *param)
 {
-	(void)ctx;
 	(void)param;
-	arg->ret = 0xFFFF0009;
-	arg->ret_origin = 0x00000002;
-	return 0;
+	return rustee_call(ctx->data, 8, 256, NULL, arg);
 }
 
 static int rustee_cancel(struct tee_context *ctx, u32 cancel_id, u32 session)
