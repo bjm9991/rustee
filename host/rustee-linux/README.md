@@ -2,14 +2,16 @@
 
 Out-of-tree `rustee_virt.ko` (**GPL-2.0-only**). Not in the TEE TCB.
 
-v0: registers with `tee.ko`, 16MiB host bounce pool, AF_VSOCK to guest CID 3
-port 7007. Fast SMCCC answered in this driver. Yielding `CALL_WITH_ARG` on
-vsock: PDU arg is a 64-byte CallFrame; MSG is in bounce at cookie a1:a2
-(a1 high 32, a2 low 32). `tmem.buf_ptr` is a pool offset.
+v0: registers with `tee.ko`, 16MiB host bounce pool, AF_VSOCK SOCK_STREAM to
+guest CID 3 port 7007. virtio REQUEST/RESPONSE is vhost, not this module.
+Fast SMCCC answered here. Yielding `CALL_WITH_ARG` on vsock: PDU arg is a
+64-byte CallFrame; MSG is in bounce at cookie a1:a2 (a1 high 32, a2 low 32).
+The bounce window starts at cookie (HAL copies the PDU payload onto
+`pool[cookie]`). `tmem.buf_ptr` is a pool offset.
 
-Open/invoke send ENTER and wait for COMPLETE (one outstanding call). Guest
-RPC is answered by `rustee-supplicant` on the userspace `gp-client`
-`StreamTransport` path until teepriv exists.
+Open/invoke pack MSG + memref copies, send ENTER, wait for COMPLETE (one
+outstanding call). Guest RPC is answered by `rustee-supplicant` on the
+userspace `gp-client` `StreamTransport` path until teepriv exists.
 
 ```
 make KDIR=/path/to/kernel

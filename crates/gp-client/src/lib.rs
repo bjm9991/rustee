@@ -157,8 +157,7 @@ impl<T: Transport> Context<T> {
         let n = write_msg(&mut self.bounce, cookie, hdr, &params).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(cookie);
         let _ = self.seq;
-        let _ = n;
-        self.transport.enter(frame, &mut self.bounce, (cookie as u32) + n as u32)?;
+        self.transport.enter(frame, &mut self.bounce, n as u32)?;
         let (out, _, _) = decode_msg(&self.bounce, cookie).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
         if out.ret != TEEC_SUCCESS {
             return Err(out.ret);
@@ -175,9 +174,9 @@ impl<T: Transport> Context<T> {
             num_params: 0,
             ..MsgArgHdr::default()
         };
-        write_msg(&mut self.bounce, cookie, hdr, &[]).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
+        let n = write_msg(&mut self.bounce, cookie, hdr, &[]).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(cookie);
-        self.transport.enter(frame, &mut self.bounce, cookie as u32 + 32)?;
+        self.transport.enter(frame, &mut self.bounce, n as u32)?;
         Ok(())
     }
 
@@ -189,9 +188,9 @@ impl<T: Transport> Context<T> {
             num_params: 0,
             ..MsgArgHdr::default()
         };
-        write_msg(&mut self.bounce, cookie, hdr, &[]).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
+        let n = write_msg(&mut self.bounce, cookie, hdr, &[]).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(cookie);
-        self.transport.enter(frame, &mut self.bounce, cookie as u32 + 32)?;
+        self.transport.enter(frame, &mut self.bounce, n as u32)?;
         Ok(())
     }
 
@@ -208,7 +207,7 @@ impl<T: Transport> Context<T> {
         let p = [MsgParam::tmem(ATTR_TYPE_TMEM_INPUT, cookie, size as u64, cookie)];
         write_msg(&mut self.bounce, 32, hdr, &p).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(32);
-        self.transport.enter(frame, &mut self.bounce, 64)?;
+        self.transport.enter(frame, &mut self.bounce, 32)?;
         Ok(cookie)
     }
 
@@ -221,7 +220,7 @@ impl<T: Transport> Context<T> {
         let p = [MsgParam::rmem(rustee_proto::ATTR_TYPE_RMEM_INPUT, 0, 0, cookie)];
         write_msg(&mut self.bounce, 32, hdr, &p).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
         let frame = CallFrame::yielding_enter(32);
-        self.transport.enter(frame, &mut self.bounce, 64)?;
+        self.transport.enter(frame, &mut self.bounce, 32)?;
         Ok(())
     }
 }
