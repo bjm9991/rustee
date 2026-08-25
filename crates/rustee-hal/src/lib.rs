@@ -188,6 +188,11 @@ impl CallFrame {
     pub fn cookie_a1a2(self) -> u64 {
         ((self.r[1] & 0xffff_ffff) << 32) | (self.r[2] & 0xffff_ffff)
     }
+
+    pub fn set_cookie_a1a2(&mut self, cookie: u64) {
+        self.r[1] = cookie >> 32;
+        self.r[2] = cookie & 0xffff_ffff;
+    }
 }
 
 /// One outstanding yielding call on v0. `recv` while busy is [`HalError::Busy`].
