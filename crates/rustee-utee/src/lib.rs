@@ -72,6 +72,20 @@ pub const TEE_MALLOC_FILL_ZERO: u32 = 0;
 pub const TEE_MALLOC_NO_FILL: u32 = 1;
 pub const TEE_MALLOC_NO_SHARE: u32 = 2;
 
+pub const TEE_STORAGE_PRIVATE: u32 = 0x00000001;
+pub const TEE_STORAGE_PERSO: u32 = 0x00000002;
+pub const TEE_STORAGE_PROTECTED: u32 = 0x00000003;
+
+pub const TEE_TYPE_DATA: u32 = 0xA00000BF;
+pub const TEE_OBJECT_ID_MAX_LEN: usize = 64;
+
+pub const TEE_CRYPTO_ELEMENT_NONE: u32 = 0;
+pub const TEE_ECC_CURVE_NIST_P256: u32 = 3;
+pub const TEE_ALG_AES_ECB_NOPAD: u32 = 0x10000010;
+pub const TEE_ALG_SHA256: u32 = 0x50000004;
+pub const TEE_ALG_ECDSA_SHA256: u32 = 0x70003042;
+pub const TEE_ALG_HKDF: u32 = 0x80000047;
+
 pub mod arith;
 pub mod c_abi;
 pub mod client;
@@ -90,8 +104,12 @@ pub use kernel_abi::{
     Dir, KernelCmd, KernelOut, Login, Param, SessionId, TeeSyscall, Uuid, param_from_gp,
     param_types,
 };
-pub use param::{Identity, Params, TeeParam, TeeTime, TeeUuid};
-pub use runtime::{Entropy, TimeSource, with_entropy, with_syscall, with_time};
+pub use param::{Identity, Params, TeeObjectInfo, TeeParam, TeeTime, TeeUuid};
+pub use runtime::{
+    Entropy, PersistentStore, TimeSource, with_entropy, with_persistent_store, with_syscall,
+    with_time,
+};
+pub use rustee_storage::{ObjectMeta, StorageError};
 pub use ta::Ta;
 
 #[cfg(test)]

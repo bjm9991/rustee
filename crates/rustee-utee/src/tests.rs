@@ -345,6 +345,163 @@ fn open_rejects_nibble_four_origin_api() {
 }
 
 #[test]
-fn algorithm_supported_is_honest_false() {
-    assert!(!TEE_IsAlgorithmSupported(0x10000010, 0));
+fn algorithm_supported_forwards_element() {
+    assert_eq!(
+        TEE_IsAlgorithmSupported(TEE_ALG_SHA256, TEE_CRYPTO_ELEMENT_NONE),
+        TEE_SUCCESS
+    );
+    assert_eq!(
+        TEE_IsAlgorithmSupported(TEE_ALG_HKDF, TEE_CRYPTO_ELEMENT_NONE),
+        TEE_ERROR_NOT_SUPPORTED
+    );
+    assert_eq!(
+        TEE_IsAlgorithmSupported(TEE_ALG_AES_ECB_NOPAD, TEE_CRYPTO_ELEMENT_NONE),
+        TEE_SUCCESS
+    );
+    assert!(crate::crypto_api::is_algorithm_supported(
+        TEE_ALG_ECDSA_SHA256,
+        TEE_CRYPTO_ELEMENT_NONE
+    ));
+    assert!(crate::crypto_api::is_algorithm_supported(
+        TEE_ALG_ECDSA_SHA256,
+        TEE_ECC_CURVE_NIST_P256
+    ));
+    assert!(!crate::crypto_api::is_algorithm_supported(
+        TEE_ALG_ECDSA_SHA256,
+        1
+    ));
+    assert!(!crate::crypto_api::is_algorithm_supported(
+        TEE_ALG_SHA256,
+        TEE_ECC_CURVE_NIST_P256
+    ));
+}
+
+#[test]
+fn arith_init_then_crypto_op() {
+    reset();
+    let mut a = [0xAAu32; 8];
+    crate::arith::init(&mut a);
+    crate::arith::from_s32(&mut a, 21);
+    assert_eq!(crate::arith::to_s32(&a), 21);
+    let mut b = [0u32; 8];
+    crate::arith::init(&mut b);
+    crate::arith::from_s32(&mut b, 21);
+    let mut c = [0u32; 8];
+    crate::arith::init(&mut c);
+    crate::arith::add(&mut c, &a, &b);
+    assert_eq!(crate::arith::to_s32(&c), 42);
+    let fmm = crate::arith::fmm_size_in_u32(2048);
+    let ctx = crate::arith::fmm_context_size_in_u32(2048);
+    assert_eq!(fmm, rustee_crypto::arith::fmm_size_in_u32(2048));
+    assert_eq!(ctx, rustee_crypto::arith::fmm_context_size_in_u32(2048));
+    assert_ne!(fmm, 0);
+    assert_ne!(ctx, 0);
+    assert_eq!(TEE_BigIntFMMSizeInU32(2048), fmm);
+    assert_eq!(TEE_BigIntFMMContextSizeInU32(2048), ctx);
+    let mut buf = [0u32; 8];
+    TEE_BigIntInit(buf.as_mut_ptr(), buf.len());
+    crate::arith::from_s32(&mut buf, 7);
+    assert_eq!(crate::arith::to_s32(&buf), 7);
+    let mut modulus = [0u32; 8];
+    crate::arith::init(&mut modulus);
+    crate::arith::from_s32(&mut modulus, 17);
+    let mut fctx = [0u32; 16];
+    assert_eq!(
+        TEE_BigIntInitFMMContext1(fctx.as_mut_ptr(), fctx.len(), modulus.as_ptr()),
+        TEE_SUCCESS
+    );
+    let mut short = [0u8; 0];
+    crate::arith::from_s32(&mut a, 255);
+    assert_eq!(
+        crate::arith::to_octet_string(&a, &mut short),
+        Err(TEE_ERROR_SHORT_BUFFER)
+    );
+}
+
+struct FakeStore {
+    items: Vec<crate::ObjectMeta>,
+}
+
+impl runtime::PersistentStore for FakeStore {
+    fn list(
+        &mut self,
+        _ta: [u8; 16],
+    ) -> Result<Vec<crate::ObjectMeta>, crate::StorageError> {
+        Ok(self.items.clone())
+    }
+}
+
+#[test]
+fn persistent_object_enumerator() {
+    reset();
+    let mut fake = FakeStore {
+        items: std::vec![
+            crate::ObjectMeta {
+                object_id: b"one".to_vec(),
+                flags: 1,
+                data_size: 10,
+            },
+            crate::ObjectMeta {
+                object_id: b"two".to_vec(),
+                flags: 2,
+                data_size: 20,
+            },
+        ],
+    };
+    with_persistent_store(&mut fake, || {
+        let mut e: TeeObjectEnumHandle = core::ptr::null_mut();
+        assert_eq!(TEE_AllocatePersistentObjectEnumerator(&mut e), TEE_SUCCESS);
+        assert_eq!(
+            TEE_StartPersistentObjectEnumerator(e, TEE_STORAGE_PRIVATE),
+            TEE_SUCCESS
+        );
+        let mut info = crate::param::TeeObjectInfo::default();
+        let mut id = [0u8; 16];
+        let mut id_len = id.len();
+        assert_eq!(
+            TEE_GetNextPersistentObject(e, &mut info, id.as_mut_ptr() as *mut c_void, &mut id_len),
+            TEE_SUCCESS
+        );
+        assert_eq!(&id[..id_len], b"one");
+        assert_eq!(info.data_size, 10);
+        assert_eq!(info.handle_flags, 1);
+        id_len = id.len();
+        assert_eq!(
+            TEE_GetNextPersistentObject(e, &mut info, id.as_mut_ptr() as *mut c_void, &mut id_len),
+            TEE_SUCCESS
+        );
+        assert_eq!(&id[..id_len], b"two");
+        id_len = id.len();
+        assert_eq!(
+            TEE_GetNextPersistentObject(e, &mut info, id.as_mut_ptr() as *mut c_void, &mut id_len),
+            TEE_ERROR_ITEM_NOT_FOUND
+        );
+        TEE_ResetPersistentObjectEnumerator(e);
+        id_len = id.len();
+        assert_eq!(
+            TEE_GetNextPersistentObject(e, &mut info, id.as_mut_ptr() as *mut c_void, &mut id_len),
+            TEE_SUCCESS
+        );
+        assert_eq!(&id[..id_len], b"one");
+        assert_eq!(
+            TEE_StartPersistentObjectEnumerator(e, TEE_STORAGE_PRIVATE),
+            TEE_SUCCESS
+        );
+        id_len = id.len();
+        assert_eq!(
+            TEE_GetNextPersistentObject(e, &mut info, id.as_mut_ptr() as *mut c_void, &mut id_len),
+            TEE_SUCCESS
+        );
+        assert_eq!(&id[..id_len], b"one");
+        assert_eq!(
+            TEE_StartPersistentObjectEnumerator(e, TEE_STORAGE_PERSO),
+            TEE_ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(
+            TEE_StartPersistentObjectEnumerator(e, TEE_STORAGE_PROTECTED),
+            TEE_ERROR_NOT_SUPPORTED
+        );
+        TEE_FreePersistentObjectEnumerator(e);
+        TEE_FreePersistentObjectEnumerator(core::ptr::null_mut());
+    });
 }

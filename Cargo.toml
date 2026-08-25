@@ -26,3 +26,4 @@ rustee-hal = { path = "crates/rustee-hal" }
 rustee-crypto = { path = "crates/rustee-crypto" }
 rustee-utee = { path = "crates/rustee-utee" }
 rustee-proto = { path = "crates/rustee-proto" }
+rustee-storage = { path = "crates/rustee-storage" }

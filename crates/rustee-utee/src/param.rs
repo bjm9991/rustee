@@ -1,7 +1,7 @@
 //! C TEE_Param / TEE_UUID layout and GP nibble conversion.
 
 use crate::kernel_abi::{param_from_gp, param_type_get, Dir, Param, Uuid, PARAM_COUNT};
-use crate::{TEE_ERROR_BAD_PARAMETERS, TEE_NUM_PARAMS, TeeResult};
+use crate::{TEE_ERROR_BAD_PARAMETERS, TEE_ERROR_SHORT_BUFFER, TEE_NUM_PARAMS, TeeResult};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,6 +54,18 @@ pub struct TeeIdentity {
 pub struct TeeTime {
     pub seconds: u32,
     pub millis: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TeeObjectInfo {
+    pub object_type: u32,
+    pub object_size: u32,
+    pub max_object_size: u32,
+    pub object_usage: u32,
+    pub data_size: usize,
+    pub data_position: usize,
+    pub handle_flags: u32,
 }
 
 #[repr(C)]
@@ -189,5 +201,51 @@ impl<'a> Params<'a> {
         } else {
             Some(unsafe { core::slice::from_raw_parts_mut(m.buffer, m.size) })
         }
+    }
+
+    pub fn set_memref_size(&mut self, i: usize, size: usize) {
+        self.params[i].memref.size = size;
+    }
+
+    pub fn memref_size(&self, i: usize) -> Option<usize> {
+        let t = param_type_get(self.types, i);
+        if !matches!(t, 5 | 6 | 7) {
+            return None;
+        }
+        Some(unsafe { self.params[i].memref.size })
+    }
+
+    /// Copy memref `src` into memref `dst`. Two `memref_mut` borrows cannot overlap.
+    /// On short dest, dest size is set to the needed length and `TEE_ERROR_SHORT_BUFFER`
+    /// is returned. On success dest size is the byte count copied.
+    pub fn copy_memref(&mut self, src: usize, dst: usize) -> Result<usize, TeeResult> {
+        if src >= TEE_NUM_PARAMS || dst >= TEE_NUM_PARAMS || src == dst {
+            return Err(TEE_ERROR_BAD_PARAMETERS);
+        }
+        let st = param_type_get(self.types, src);
+        let dt = param_type_get(self.types, dst);
+        if !matches!(st, 5 | 6 | 7) || !matches!(dt, 5 | 6 | 7) {
+            return Err(TEE_ERROR_BAD_PARAMETERS);
+        }
+        let (sp, slen) = unsafe {
+            let m = self.params[src].memref;
+            (m.buffer, m.size)
+        };
+        let (dp, dlen) = unsafe {
+            let m = self.params[dst].memref;
+            (m.buffer, m.size)
+        };
+        if slen > dlen {
+            self.params[dst].memref.size = slen;
+            return Err(TEE_ERROR_SHORT_BUFFER);
+        }
+        if slen != 0 {
+            if sp.is_null() || dp.is_null() {
+                return Err(TEE_ERROR_BAD_PARAMETERS);
+            }
+            unsafe { core::ptr::copy(sp, dp, slen) };
+        }
+        self.params[dst].memref.size = slen;
+        Ok(slen)
     }
 }

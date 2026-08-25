@@ -1,13 +1,17 @@
 //! `#[no_mangle] extern "C"` for every prototype in tee_internal_api.h we implement.
 
-use crate::param::{TeeIdentity, TeeParam, TeeTime, TeeUuid};
+use crate::param::{TeeIdentity, TeeObjectInfo, TeeParam, TeeTime, TeeUuid};
 use crate::property::{self, PROPSET_CLIENT, PROPSET_TA, PROPSET_TEE};
 use crate::runtime;
-use crate::{TEE_ERROR_BAD_PARAMETERS, TEE_ERROR_OUT_OF_MEMORY, TEE_SUCCESS, TeeResult};
+use crate::{
+    TEE_ERROR_BAD_PARAMETERS, TEE_ERROR_NOT_SUPPORTED, TEE_ERROR_OUT_OF_MEMORY,
+    TEE_ERROR_SHORT_BUFFER, TEE_SUCCESS, TEE_TYPE_DATA, TeeResult,
+};
 use core::ffi::{c_char, c_void, CStr};
 
 pub type TeePropSetHandle = *mut c_void;
 pub type TeeTaSessionHandle = *mut c_void;
+pub type TeeObjectEnumHandle = *mut c_void;
 
 fn handle_us(h: TeePropSetHandle) -> usize {
     h as usize
@@ -403,8 +407,12 @@ pub extern "C" fn TEE_GetREETime(time: *mut TeeTime) {
 }
 
 #[no_mangle]
-pub extern "C" fn TEE_IsAlgorithmSupported(alg_id: u32, element: u32) -> bool {
-    crate::crypto_api::is_algorithm_supported(alg_id, element)
+pub extern "C" fn TEE_IsAlgorithmSupported(alg_id: u32, element: u32) -> TeeResult {
+    if crate::crypto_api::is_algorithm_supported(alg_id, element) {
+        TEE_SUCCESS
+    } else {
+        TEE_ERROR_NOT_SUPPORTED
+    }
 }
 
 #[no_mangle]
@@ -444,6 +452,83 @@ pub extern "C" fn TEE_BigIntInitFMMContext(context: *mut u32, len: usize, modulu
 #[no_mangle]
 pub extern "C" fn TEE_BigIntInitFMM(big_int_fmm: *mut u32, len: usize) {
     crate::arith::big_int_init_fmm(big_int_fmm, len);
+}
+
+
+#[no_mangle]
+pub extern "C" fn TEE_AllocatePersistentObjectEnumerator(
+    enumerator: *mut TeeObjectEnumHandle,
+) -> TeeResult {
+    if enumerator.is_null() {
+        return TEE_ERROR_BAD_PARAMETERS;
+    }
+    match runtime::alloc_object_enumerator() {
+        Some(h) => {
+            unsafe { *enumerator = h as TeeObjectEnumHandle };
+            TEE_SUCCESS
+        }
+        None => TEE_ERROR_OUT_OF_MEMORY,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn TEE_FreePersistentObjectEnumerator(enumerator: TeeObjectEnumHandle) {
+    runtime::free_object_enumerator(enumerator as usize);
+}
+
+#[no_mangle]
+pub extern "C" fn TEE_ResetPersistentObjectEnumerator(enumerator: TeeObjectEnumHandle) {
+    runtime::reset_object_enumerator(enumerator as usize);
+}
+
+#[no_mangle]
+pub extern "C" fn TEE_StartPersistentObjectEnumerator(
+    enumerator: TeeObjectEnumHandle,
+    storage_id: u32,
+) -> TeeResult {
+    runtime::start_object_enumerator(enumerator as usize, storage_id)
+}
+
+#[no_mangle]
+pub extern "C" fn TEE_GetNextPersistentObject(
+    enumerator: TeeObjectEnumHandle,
+    object_info: *mut TeeObjectInfo,
+    object_id: *mut c_void,
+    object_id_len: *mut usize,
+) -> TeeResult {
+    if object_id_len.is_null() {
+        return TEE_ERROR_BAD_PARAMETERS;
+    }
+    let item = match runtime::object_enum_peek(enumerator as usize) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let need = item.object_id.len();
+    let cap = unsafe { *object_id_len };
+    unsafe { *object_id_len = need };
+    if object_id.is_null() || cap < need {
+        return TEE_ERROR_SHORT_BUFFER;
+    }
+    if need != 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(item.object_id.as_ptr(), object_id as *mut u8, need);
+        }
+    }
+    if !object_info.is_null() {
+        unsafe {
+            *object_info = TeeObjectInfo {
+                object_type: TEE_TYPE_DATA,
+                object_size: 0,
+                max_object_size: 0,
+                object_usage: 0,
+                data_size: item.data_size as usize,
+                data_position: 0,
+                handle_flags: item.flags,
+            };
+        }
+    }
+    runtime::object_enum_advance(enumerator as usize);
+    TEE_SUCCESS
 }
 
 pub fn propset_ta() -> TeePropSetHandle {

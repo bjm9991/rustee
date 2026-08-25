@@ -1,12 +1,20 @@
-//! Per-TA instance state plus test hooks (syscall, time, entropy).
+//! Per-TA instance state plus test hooks (syscall, time, entropy, persistent store).
 
 use crate::header::TaProperties;
 use crate::kernel_abi::{KernelCmd, KernelOut, TeeSyscall};
 use crate::mem::Heap;
 use crate::param::{Identity, TeeTime};
 use crate::property::{self, PropCtx};
+use crate::{
+    TEE_ERROR_CORRUPT_OBJECT, TEE_ERROR_ITEM_NOT_FOUND, TEE_ERROR_NOT_SUPPORTED,
+    TEE_ERROR_STORAGE_NO_SPACE, TEE_ERROR_STORAGE_NOT_AVAILABLE, TEE_STORAGE_PERSO,
+    TEE_STORAGE_PRIVATE, TEE_STORAGE_PROTECTED, TEE_SUCCESS, TeeResult,
+};
+use alloc::vec::Vec;
+use rustee_storage::{ObjectMeta, StorageError};
 
 const ENUM_SLOTS: usize = 4;
+const OBJ_ENUM_SLOTS: usize = 4;
 const SESSION_SLOTS: usize = 16;
 
 #[derive(Clone, Copy)]
@@ -24,6 +32,24 @@ impl EnumSlot {
             set: 0,
             idx: 0,
             started: false,
+        }
+    }
+}
+
+struct ObjEnumSlot {
+    used: bool,
+    started: bool,
+    idx: usize,
+    items: Vec<ObjectMeta>,
+}
+
+impl ObjEnumSlot {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            started: false,
+            idx: 0,
+            items: Vec::new(),
         }
     }
 }
@@ -55,6 +81,12 @@ struct EntropyHook {
     fill: Option<unsafe fn(*mut (), *mut u8, usize)>,
 }
 
+#[derive(Clone, Copy)]
+struct StoreHook {
+    ptr: *mut (),
+    list: Option<unsafe fn(*mut (), [u8; 16]) -> Result<Vec<ObjectMeta>, StorageError>>,
+}
+
 pub trait TimeSource {
     fn system_time(&self) -> TeeTime;
     fn ree_time(&self) -> TeeTime;
@@ -69,6 +101,12 @@ pub trait Entropy {
     fn fill(&mut self, dest: &mut [u8]);
 }
 
+/// Persistent-object directory. Kernel plugs `ReeFs`; tests inject a fake.
+/// Do not construct `ReeFs` inside utee (it needs Entropy + Huk + FsRpc from HAL).
+pub trait PersistentStore {
+    fn list(&mut self, ta: [u8; 16]) -> Result<Vec<ObjectMeta>, StorageError>;
+}
+
 pub struct Core {
     pub heap: Heap,
     pub prop: PropCtx,
@@ -78,9 +116,11 @@ pub struct Core {
     pub persist: PersistTime,
     sessions: [u32; SESSION_SLOTS],
     enums: [EnumSlot; ENUM_SLOTS],
+    obj_enums: [ObjEnumSlot; OBJ_ENUM_SLOTS],
     syscall: SyscallHook,
     time: TimeHook,
     entropy: EntropyHook,
+    store: StoreHook,
 }
 
 impl Core {
@@ -104,6 +144,12 @@ impl Core {
             },
             sessions: [0; SESSION_SLOTS],
             enums: [EnumSlot::empty(); ENUM_SLOTS],
+            obj_enums: [
+                ObjEnumSlot::empty(),
+                ObjEnumSlot::empty(),
+                ObjEnumSlot::empty(),
+                ObjEnumSlot::empty(),
+            ],
             syscall: SyscallHook {
                 ptr: core::ptr::null_mut(),
                 call: None,
@@ -117,6 +163,10 @@ impl Core {
             entropy: EntropyHook {
                 ptr: core::ptr::null_mut(),
                 fill: None,
+            },
+            store: StoreHook {
+                ptr: core::ptr::null_mut(),
+                list: None,
             },
         }
     }
@@ -400,6 +450,109 @@ pub fn enumerator_current(h: usize) -> Result<(usize, &'static str), crate::TeeR
     })
 }
 
+pub fn map_storage_error(e: StorageError) -> TeeResult {
+    match e {
+        StorageError::TooBig => TEE_ERROR_STORAGE_NO_SPACE,
+        StorageError::Corrupt => TEE_ERROR_CORRUPT_OBJECT,
+        StorageError::NotFound => TEE_ERROR_ITEM_NOT_FOUND,
+        StorageError::Crypto => crate::TEE_ERROR_SECURITY,
+        StorageError::Fs => TEE_ERROR_STORAGE_NOT_AVAILABLE,
+    }
+}
+
+fn list_persistent(ta: [u8; 16]) -> Result<Vec<ObjectMeta>, StorageError> {
+    let hook = with_core(|c| c.store);
+    match hook.list {
+        Some(f) => unsafe { f(hook.ptr, ta) },
+        None => Err(StorageError::Fs),
+    }
+}
+
+fn obj_slot_mut(c: &mut Core, h: usize) -> Option<&mut ObjEnumSlot> {
+    if h == 0 {
+        return None;
+    }
+    c.obj_enums.get_mut(h - 1).filter(|e| e.used)
+}
+
+pub fn alloc_object_enumerator() -> Option<usize> {
+    with_core(|c| {
+        for (i, e) in c.obj_enums.iter_mut().enumerate() {
+            if !e.used {
+                *e = ObjEnumSlot {
+                    used: true,
+                    started: false,
+                    idx: 0,
+                    items: Vec::new(),
+                };
+                return Some(i + 1);
+            }
+        }
+        None
+    })
+}
+
+pub fn free_object_enumerator(h: usize) {
+    with_core(|c| {
+        if let Some(e) = obj_slot_mut(c, h) {
+            *e = ObjEnumSlot::empty();
+        }
+    });
+}
+
+pub fn reset_object_enumerator(h: usize) {
+    with_core(|c| {
+        if let Some(e) = obj_slot_mut(c, h) {
+            e.idx = 0;
+        }
+    });
+}
+
+pub fn start_object_enumerator(h: usize, storage_id: u32) -> TeeResult {
+    match storage_id {
+        TEE_STORAGE_PERSO | TEE_STORAGE_PROTECTED => return TEE_ERROR_NOT_SUPPORTED,
+        TEE_STORAGE_PRIVATE => {}
+        _ => return TEE_ERROR_ITEM_NOT_FOUND,
+    }
+    if h == 0 {
+        return TEE_ERROR_ITEM_NOT_FOUND;
+    }
+    let ta = caller_uuid().0;
+    let listed = list_persistent(ta);
+    let items = match listed {
+        Ok(v) => v,
+        Err(e) => return map_storage_error(e),
+    };
+    with_core(|c| {
+        let e = match obj_slot_mut(c, h) {
+            Some(e) => e,
+            None => return TEE_ERROR_ITEM_NOT_FOUND,
+        };
+        e.items = items;
+        e.idx = 0;
+        e.started = true;
+        TEE_SUCCESS
+    })
+}
+
+pub fn object_enum_peek(h: usize) -> Result<ObjectMeta, TeeResult> {
+    with_core(|c| {
+        let e = obj_slot_mut(c, h).ok_or(TEE_ERROR_ITEM_NOT_FOUND)?;
+        if !e.started {
+            return Err(TEE_ERROR_ITEM_NOT_FOUND);
+        }
+        e.items.get(e.idx).cloned().ok_or(TEE_ERROR_ITEM_NOT_FOUND)
+    })
+}
+
+pub fn object_enum_advance(h: usize) {
+    with_core(|c| {
+        if let Some(e) = obj_slot_mut(c, h) {
+            e.idx = e.idx.saturating_add(1);
+        }
+    });
+}
+
 
 unsafe fn syscall_shim<S: TeeSyscall>(ptr: *mut (), cmd: KernelCmd) -> KernelOut {
     (*(ptr as *mut S)).handle(cmd)
@@ -420,6 +573,13 @@ unsafe fn time_wait_shim<T: TimeSource>(ptr: *mut (), timeout_ms: u32) -> crate:
 unsafe fn entropy_shim<E: Entropy>(ptr: *mut (), dest: *mut u8, len: usize) {
     let sl = core::slice::from_raw_parts_mut(dest, len);
     (*(ptr as *mut E)).fill(sl);
+}
+
+unsafe fn store_list_shim<S: PersistentStore>(
+    ptr: *mut (),
+    ta: [u8; 16],
+) -> Result<Vec<ObjectMeta>, StorageError> {
+    (*(ptr as *mut S)).list(ta)
 }
 
 pub fn with_syscall<S: TeeSyscall, R>(s: &mut S, f: impl FnOnce() -> R) -> R {
@@ -475,6 +635,25 @@ pub fn with_entropy<E: Entropy, R>(e: &mut E, f: impl FnOnce() -> R) -> R {
     impl Drop for Guard {
         fn drop(&mut self) {
             with_core(|c| c.entropy = self.0);
+        }
+    }
+    let _g = Guard(prev);
+    f()
+}
+
+pub fn with_persistent_store<S: PersistentStore, R>(s: &mut S, f: impl FnOnce() -> R) -> R {
+    let prev = with_core(|c| {
+        let old = c.store;
+        c.store = StoreHook {
+            ptr: s as *mut S as *mut (),
+            list: Some(store_list_shim::<S>),
+        };
+        old
+    });
+    struct Guard(StoreHook);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            with_core(|c| c.store = self.0);
         }
     }
     let _g = Guard(prev);

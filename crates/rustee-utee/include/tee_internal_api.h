@@ -70,6 +70,14 @@ TEE_Result TEE_GetTAPersistentTime(TEE_Time *time);
 TEE_Result TEE_SetTAPersistentTime(const TEE_Time *time);
 void TEE_GetREETime(TEE_Time *time);
 
+TEE_Result TEE_AllocatePersistentObjectEnumerator(TEE_ObjectEnumHandle *enumerator);
+void TEE_FreePersistentObjectEnumerator(TEE_ObjectEnumHandle enumerator);
+void TEE_ResetPersistentObjectEnumerator(TEE_ObjectEnumHandle enumerator);
+TEE_Result TEE_StartPersistentObjectEnumerator(TEE_ObjectEnumHandle enumerator,
+	uint32_t storageID);
+TEE_Result TEE_GetNextPersistentObject(TEE_ObjectEnumHandle enumerator,
+	TEE_ObjectInfo *objectInfo, void *objectID, size_t *objectIDLen);
+
 TEE_Result TEE_IsAlgorithmSupported(uint32_t algId, uint32_t element);
 void TEE_GenerateRandom(void *randomBuffer, size_t randomBufferLen);
 
