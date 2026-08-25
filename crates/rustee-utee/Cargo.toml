@@ -7,4 +7,5 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rustee-crypto = { path = "../rustee-crypto", default-features = false }
+rustee-crypto = { workspace = true, features = ["arith"] }
+rustee-storage = { workspace = true }
