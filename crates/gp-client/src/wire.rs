@@ -50,11 +50,12 @@ pub fn write_pdu(
     let hdr = PduHeader::yielding(kind, seq, bounce_len);
     write_all(w, &hdr.encode())?;
     write_all(w, &frame.encode())?;
+    let c = frame.cookie() as usize;
     let n = bounce_len as usize;
-    if n > bounce.len() {
+    if c.checked_add(n).map(|e| e > bounce.len()).unwrap_or(true) {
         return Err(TEEC_ERROR_COMMUNICATION);
     }
-    write_all(w, &bounce[..n])?;
+    write_all(w, &bounce[c..c + n])?;
     Ok(())
 }
 
@@ -65,12 +66,13 @@ pub fn read_pdu(r: &mut impl Read, bounce: &mut [u8]) -> Result<(PduHeader, Call
     let mut fb = [0u8; CALL_FRAME_LEN];
     read_exact(r, &mut fb)?;
     let frame = CallFrame::decode(&fb).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
+    let c = frame.cookie() as usize;
     let n = hdr.bounce_len as usize;
-    if n > bounce.len() {
+    if c.checked_add(n).map(|e| e > bounce.len()).unwrap_or(true) {
         return Err(TEEC_ERROR_COMMUNICATION);
     }
     if n > 0 {
-        read_exact(r, &mut bounce[..n])?;
+        read_exact(r, &mut bounce[c..c + n])?;
     }
     Ok((hdr, frame))
 }
@@ -171,7 +173,7 @@ mod tests {
             assert_eq!(hdr.kind, KIND_ENTER);
             assert_eq!(hdr.arg_len, 64);
             assert_eq!(frame.r[0] as u32, SMC_CALL_WITH_ARG);
-            bounce[0] = 0xAB;
+            bounce[8] = 0xAB;
             write_pdu(
                 &mut server,
                 KIND_COMPLETE,
@@ -183,17 +185,17 @@ mod tests {
             .unwrap();
         });
         let mut bounce = vec![0u8; 256];
-        bounce[0] = 0x11;
+        bounce[8] = 0x11;
         let mut frame = CallFrame::default();
         frame.r[0] = SMC_CALL_WITH_ARG as u64;
         frame.set_cookie(8);
         let out = host.enter(frame, &mut bounce, 16).unwrap();
-        assert_eq!(bounce[0], 0xAB);
+        assert_eq!(bounce[8], 0xAB);
         assert_eq!(out.cookie(), 8);
     }
 
-    fn mark_rpc(b: &mut [u8], _c: u64) -> Result<(), u32> {
-        b[1] = 0xCD;
+    fn mark_rpc(b: &mut [u8], c: u64) -> Result<(), u32> {
+        b[c as usize + 1] = 0xCD;
         Ok(())
     }
 
@@ -206,7 +208,7 @@ mod tests {
             let mut bounce = vec![0u8; 256];
             let (hdr, frame) = read_pdu(&mut server, &mut bounce).unwrap();
             assert_eq!(hdr.kind, KIND_ENTER);
-            bounce[0] = 0x22;
+            bounce[8] = 0x22;
             write_pdu(
                 &mut server,
                 KIND_RPC,
@@ -218,8 +220,8 @@ mod tests {
             .unwrap();
             let (rh, _) = read_pdu(&mut server, &mut bounce).unwrap();
             assert_eq!(rh.kind, KIND_RPC_REPLY);
-            assert_eq!(bounce[1], 0xCD);
-            bounce[0] = 0xAB;
+            assert_eq!(bounce[9], 0xCD);
+            bounce[8] = 0xAB;
             write_pdu(
                 &mut server,
                 KIND_COMPLETE,
@@ -235,7 +237,7 @@ mod tests {
         frame.r[0] = SMC_CALL_WITH_ARG as u64;
         frame.set_cookie(8);
         let _ = host.enter(frame, &mut bounce, 16).unwrap();
-        assert_eq!(bounce[0], 0xAB);
+        assert_eq!(bounce[8], 0xAB);
     }
 
     #[test]
