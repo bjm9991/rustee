@@ -1,16 +1,16 @@
 //! ELF stub loader. Early-TA or LOAD_TA bytes. Envelope verify via CryptoProvider.
 
-use crate::abi::{Uuid, TEE_ERROR_SECURITY};
-use crate::header::{
-    find_ta_head, parse_rtsg, parse_ta_head, TaProperties, V0_DEV_PUBKEY, RTSG_MAGIC,
-};
+use crate::abi::{TaEntryPoints, Uuid, TEE_ERROR_SECURITY};
+use crate::elf::{parse_elf, TaSymbols};
+use crate::header::{parse_rtsg, TaProperties, V0_DEV_PUBKEY, RTSG_MAGIC};
 use rustee_crypto::CryptoProvider;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct EarlyTa {
     pub uuid: Uuid,
     pub props: TaProperties,
     pub image: &'static [u8],
+    pub entries: Option<TaEntryPoints>,
 }
 
 pub struct EarlyTas {
@@ -33,6 +33,7 @@ impl EarlyTas {
 
 pub struct Loaded {
     pub props: TaProperties,
+    pub symbols: Option<TaSymbols>,
 }
 
 pub fn load_image<C: CryptoProvider>(crypto: &C, bytes: &[u8]) -> Result<Loaded, u32> {
@@ -54,7 +55,9 @@ pub fn load_image<C: CryptoProvider>(crypto: &C, bytes: &[u8]) -> Result<Loaded,
     } else {
         bytes
     };
-    let head = find_ta_head(elf)?;
-    let props = parse_ta_head(head)?;
-    Ok(Loaded { props })
+    let parsed = parse_elf(elf)?;
+    Ok(Loaded {
+        props: parsed.props,
+        symbols: parsed.symbols,
+    })
 }

@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod abi;
+mod elf;
 mod header;
 mod instance;
 mod loader;
@@ -212,7 +213,7 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             return self.bind_session(id, uuid, login, params);
         }
         if let Some(early) = self.early.get(uuid).cloned() {
-            return self.instantiate_and_bind(early.props, uuid, login, params);
+            return self.instantiate_and_bind(early.props, uuid, login, params, early.entries);
         }
         if self.yielding.is_some() {
             return KernelOut::done_err(TEE_ERROR_BUSY);
@@ -233,6 +234,7 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         uuid: Uuid,
         login: Login,
         params: [Param; PARAM_COUNT],
+        entries: Option<TaEntryPoints>,
     ) -> KernelOut {
         if props.uuid != uuid {
             return KernelOut::done_err(TEE_ERROR_SECURITY);
@@ -244,10 +246,24 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             aspace: None,
             session_count: 0,
             state: InstanceState::Live,
+            entries,
         };
         let Some(iid) = self.instances.alloc(inst) else {
             return KernelOut::done_err(TEE_ERROR_OUT_OF_MEMORY);
         };
+        if let Some(ep) = entries {
+            self.current_instance = Some(iid);
+            let code = unsafe { (ep.create)() };
+            self.current_instance = None;
+            if code != TEE_SUCCESS {
+                self.instances.drop_id(iid);
+                return KernelOut::Done {
+                    result: TeeResult::ta(code),
+                    session: None,
+                    params,
+                };
+            }
+        }
         self.bind_session(iid, uuid, login, params)
     }
 
@@ -256,14 +272,30 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
         iid: InstanceId,
         uuid: Uuid,
         login: Login,
-        params: [Param; PARAM_COUNT],
+        mut params: [Param; PARAM_COUNT],
     ) -> KernelOut {
+        let mut ctx = 0usize;
+        if let Some(ep) = self.instances.get(iid).and_then(|i| i.entries) {
+            let types = param_types_of(&params);
+            let mut raw = params_to_raw(&params);
+            self.current_instance = Some(iid);
+            let code = unsafe { (ep.open_session)(types, raw.as_mut_ptr(), &mut ctx) };
+            self.current_instance = None;
+            params_from_raw(&mut params, &raw);
+            if code != TEE_SUCCESS {
+                return KernelOut::Done {
+                    result: TeeResult::ta(code),
+                    session: None,
+                    params,
+                };
+            }
+        }
         let sess = Session {
             id: SessionId(0),
             uuid,
             kind: SessionKind::UserTa,
             instance: Some(iid),
-            ta_sess_ctx: 0,
+            ta_sess_ctx: ctx,
             state: SessionState::Ready,
             client: login,
         };
@@ -314,15 +346,34 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             SessionKind::UserTa => {
                 // REE memrefs: register → sync_in → map_into → invoke → sync_out
                 // is HAL SharedMem. EXEC+SHM is illegal (rejected when mapping).
-                // TA-to-TA MemrefSrc::Ta skips the bounce pool.
+                // TA-to-TA MemrefSrc::Ta skips the bounce pool; VA is the TA buffer.
                 self.current_instance = sess.instance;
-                let _ = cmd_id;
+                let entries = sess
+                    .instance
+                    .and_then(|id| self.instances.get(id).and_then(|i| i.entries));
+                let out = if let Some(ep) = entries {
+                    let types = param_types_of(&params);
+                    let mut raw = params_to_raw(&params);
+                    let code = unsafe { (ep.invoke)(sess.ta_sess_ctx, cmd_id, types, raw.as_mut_ptr()) };
+                    params_from_raw(&mut params, &raw);
+                    KernelOut::Done {
+                        result: if code == TEE_SUCCESS {
+                            TeeResult::ok()
+                        } else {
+                            TeeResult::ta(code)
+                        },
+                        session: Some(session),
+                        params,
+                    }
+                } else {
+                    KernelOut::Done {
+                        result: TeeResult::ok(),
+                        session: Some(session),
+                        params,
+                    }
+                };
                 self.current_instance = None;
-                KernelOut::Done {
-                    result: TeeResult::ok(),
-                    session: Some(session),
-                    params,
-                }
+                out
             }
         }
     }
@@ -339,9 +390,20 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
             }
             SessionKind::UserTa => {
                 if let Some(iid) = sess.instance {
+                    let entries = self.instances.get(iid).and_then(|i| i.entries);
+                    if let Some(ep) = entries {
+                        self.current_instance = Some(iid);
+                        unsafe { (ep.close_session)(sess.ta_sess_ctx) };
+                        self.current_instance = None;
+                    }
                     if let Some(inst) = self.instances.get_mut(iid) {
                         inst.session_count = inst.session_count.saturating_sub(1);
                         if inst.session_count == 0 && !inst.props.instance_keep_alive {
+                            if let Some(ep) = inst.entries {
+                                self.current_instance = Some(iid);
+                                unsafe { (ep.destroy)() };
+                                self.current_instance = None;
+                            }
                             inst.state = InstanceState::Dead;
                             if let Some(mut aspace) = inst.aspace.take() {
                                 aspace.drop_all();
@@ -379,11 +441,11 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                 }
                 let _ = timeout_ms;
                 match load_image(&self.crypto, &bytes) {
-                    Ok(Loaded { props }) => {
+                    Ok(Loaded { props, .. }) => {
                         if props.uuid != uuid {
                             KernelOut::done_err(TEE_ERROR_SECURITY)
                         } else {
-                            self.instantiate_and_bind(props, uuid, login, params)
+                            self.instantiate_and_bind(props, uuid, login, params, None)
                         }
                     }
                     Err(code) => KernelOut::done_err(code),
@@ -677,6 +739,7 @@ mod tests {
             uuid,
             props,
             image: &[],
+            entries: None,
         });
         let open = |k: &mut Kernel<MockHal, SoftwareProvider>| {
             k.handle(KernelCmd::OpenSession {
@@ -721,6 +784,7 @@ mod tests {
             uuid,
             props,
             image: &[],
+            entries: None,
         });
         let out = k.handle(KernelCmd::OpenSession {
             uuid,
@@ -767,6 +831,7 @@ mod tests {
                 ta_version: 1,
             },
             image: &[],
+            entries: None,
         });
         let sid = match k.handle(KernelCmd::OpenSession {
             uuid,
@@ -891,5 +956,193 @@ mod tests {
         img.extend_from_slice(&elf);
         let loaded = load_image(&crypto, &img).expect("rtsg verify");
         assert_eq!(loaded.props.uuid, uuid);
+    }
+
+    const HELLO_UUID: Uuid = Uuid([
+        0x8d, 0x82, 0x5f, 0x6a, 0x1c, 0x4b, 0x4c, 0x9f, 0x9e, 0x3a, 0x2b, 0x7c, 0x6d, 0x5e, 0x4f,
+        0x30,
+    ]);
+
+    unsafe extern "C" fn hello_create() -> u32 {
+        TEE_SUCCESS
+    }
+    unsafe extern "C" fn hello_destroy() {}
+    unsafe extern "C" fn hello_open(_t: u32, _p: *mut ParamRaw, ctx: *mut usize) -> u32 {
+        unsafe { *ctx = 0 };
+        TEE_SUCCESS
+    }
+    unsafe extern "C" fn hello_close(_ctx: usize) {}
+    unsafe extern "C" fn hello_invoke(
+        _ctx: usize,
+        cmd: u32,
+        _types: u32,
+        params: *mut ParamRaw,
+    ) -> u32 {
+        if cmd != 0 {
+            return TEE_ERROR_NOT_SUPPORTED;
+        }
+        unsafe {
+            let src = (*params.add(0)).memref;
+            let dst = (*params.add(1)).memref;
+            if src.buffer.is_null() || dst.buffer.is_null() {
+                return TEE_ERROR_BAD_PARAMETERS;
+            }
+            if dst.size < src.size {
+                (*params.add(1)).memref.size = src.size;
+                return TEE_ERROR_SHORT_BUFFER;
+            }
+            core::ptr::copy_nonoverlapping(src.buffer, dst.buffer, src.size);
+            (*params.add(1)).memref.size = src.size;
+            TEE_SUCCESS
+        }
+    }
+
+    const HELLO_ENTRIES: TaEntryPoints = TaEntryPoints {
+        create: hello_create,
+        destroy: hello_destroy,
+        open_session: hello_open,
+        close_session: hello_close,
+        invoke: hello_invoke,
+    };
+
+    fn hello_kernel() -> Kernel<MockHal, SoftwareProvider> {
+        let mut k = k();
+        k.register_early_ta(EarlyTa {
+            uuid: HELLO_UUID,
+            props: TaProperties {
+                uuid: HELLO_UUID,
+                stack_size: 8192,
+                data_size: 8192,
+                single_instance: true,
+                multi_session: false,
+                instance_keep_alive: false,
+                endian: 0,
+                ta_version: 1,
+            },
+            image: &[],
+            entries: Some(HELLO_ENTRIES),
+        });
+        k
+    }
+
+    fn open_hello(k: &mut Kernel<MockHal, SoftwareProvider>) -> SessionId {
+        match k.handle(KernelCmd::OpenSession {
+            uuid: HELLO_UUID,
+            login: Login::Public,
+            params: none_params(),
+            cancel_id: 1,
+            timeout_ms: TEE_TIMEOUT_INFINITE,
+        }) {
+            KernelOut::Done {
+                result,
+                session,
+                ..
+            } => {
+                assert_eq!(result.code, TEE_SUCCESS);
+                session.unwrap()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_cmd0_copies_memref_0_to_1() {
+        let mut k = hello_kernel();
+        let sid = open_hello(&mut k);
+        let mut src = *b"hello-rs";
+        let mut dst = [0u8; 16];
+        let params = [
+            Param::Memref {
+                src: MemrefSrc::Ta {
+                    va: src.as_mut_ptr() as usize,
+                },
+                size: src.len(),
+                dir: Dir::In,
+            },
+            Param::Memref {
+                src: MemrefSrc::Ta {
+                    va: dst.as_mut_ptr() as usize,
+                },
+                size: dst.len(),
+                dir: Dir::Out,
+            },
+            Param::None,
+            Param::None,
+        ];
+        match k.handle(KernelCmd::Invoke {
+            session: sid,
+            cmd_id: 0,
+            params,
+            cancel_id: 2,
+            timeout_ms: TEE_TIMEOUT_INFINITE,
+        }) {
+            KernelOut::Done { result, params, .. } => {
+                assert_eq!(result.code, TEE_SUCCESS);
+                assert_eq!(&dst[..8], b"hello-rs");
+                match params[1] {
+                    Param::Memref { size, .. } => assert_eq!(size, 8),
+                    _ => panic!(),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_cmd0_short_buffer() {
+        let mut k = hello_kernel();
+        let sid = open_hello(&mut k);
+        let mut src = *b"hello-rs";
+        let mut dst = [0u8; 3];
+        let params = [
+            Param::Memref {
+                src: MemrefSrc::Ta {
+                    va: src.as_mut_ptr() as usize,
+                },
+                size: src.len(),
+                dir: Dir::In,
+            },
+            Param::Memref {
+                src: MemrefSrc::Ta {
+                    va: dst.as_mut_ptr() as usize,
+                },
+                size: dst.len(),
+                dir: Dir::Out,
+            },
+            Param::None,
+            Param::None,
+        ];
+        match k.handle(KernelCmd::Invoke {
+            session: sid,
+            cmd_id: 0,
+            params,
+            cancel_id: 3,
+            timeout_ms: TEE_TIMEOUT_INFINITE,
+        }) {
+            KernelOut::Done { result, params, .. } => {
+                assert_eq!(result.code, TEE_ERROR_SHORT_BUFFER);
+                assert_eq!(result.origin, Origin::TrustedApp);
+                match params[1] {
+                    Param::Memref { size, .. } => assert_eq!(size, 8),
+                    _ => panic!(),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn elf_hello_head_and_symbols() {
+        let bytes = include_bytes!("testdata/min-ta.elf");
+        let img = crate::elf::parse_elf(bytes).expect("elf");
+        assert_eq!(img.props.uuid, HELLO_UUID);
+        assert_eq!(img.props.stack_size, 8192);
+        assert!(!img.segs.is_empty());
+        let s = img.symbols.expect("TA_* symbols");
+        assert_eq!(s.create, 0x100);
+        assert_eq!(s.destroy, 0x110);
+        assert_eq!(s.open_session, 0x120);
+        assert_eq!(s.close_session, 0x130);
+        assert_eq!(s.invoke, 0x140);
     }
 }
