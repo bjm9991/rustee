@@ -1,4 +1,4 @@
-use crate::abi::{InstanceId, Uuid};
+use crate::abi::{InstanceId, TaEntryPoints, Uuid};
 use crate::header::TaProperties;
 use rustee_hal::Hal;
 
@@ -18,6 +18,7 @@ pub struct Instance<H: Hal> {
     pub aspace: Option<H::AddressSpace>,
     pub session_count: u16,
     pub state: InstanceState,
+    pub entries: Option<TaEntryPoints>,
 }
 
 pub struct InstanceTable<H: Hal> {
