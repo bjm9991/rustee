@@ -37,6 +37,13 @@ pub const KIND_COMPLETE: u32 = 3;
 pub const KIND_RPC_REPLY: u32 = 4;
 pub const MSG_ARG_ALIGN: usize = 8;
 
+mod vsock;
+pub use vsock::{
+    encode_pdu, read_pdu, VirtioVsockHdr, VsockConn, VsockListener, VIRTIO_PCI_DEVICE_VSOCK,
+    VIRTIO_PCI_VENDOR, VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
+    VIRTIO_VSOCK_OP_RW, VIRTIO_VSOCK_TYPE_STREAM,
+};
+
 pub const VIRT_ENTROPY_NOTICE: &str =
     "RUSTEE virt entropy is ReeHost (virtio-rng / host), not Isolated";
 pub const VIRT_HUK_NOTICE: &str =
@@ -257,6 +264,8 @@ pub struct VirtHal {
     entropy: VirtEntropy,
     huk: VirtHuk,
     shms: [Option<VirtShm>; 32],
+    listener: VsockListener,
+    conn: Option<VsockConn>,
 }
 
 impl VirtHal {
@@ -332,6 +341,42 @@ impl VirtHal {
         Ok(())
     }
 
+    /// Bind guest CID 3 port 7007. Host rustee-virt.ko connects after this.
+    pub fn listen_vsock(&mut self) {
+        self.listener.listen();
+    }
+
+    /// virtio-vsock REQUEST -> RESPONSE. One SOCK_STREAM.
+    pub fn accept_connect(&mut self, req: &VirtioVsockHdr) -> Result<VirtioVsockHdr, HalError> {
+        let resp = self.listener.accept(req)?;
+        self.conn = Some(VsockConn::from_accept(req, &self.listener));
+        Ok(resp)
+    }
+
+    pub fn push_host_rw(&mut self, hdr: &VirtioVsockHdr, payload: &[u8]) -> Result<(), HalError> {
+        self.conn.as_mut().ok_or(HalError::NotFound)?.push_rw(hdr, payload)
+    }
+
+    /// Read ENTER from the accepted stream, copy bounce, return CallFrame.
+    pub fn recv_enter(&mut self) -> Result<CallFrame, HalError> {
+        let (hdr, frame, bounce) = {
+            let conn = self.conn.as_mut().ok_or(HalError::NotFound)?;
+            read_pdu(conn)?
+        };
+        self.feed_pdu(hdr, frame, &bounce)?;
+        self.call_gate().recv()
+    }
+
+    /// CallGate complete, then wrap COMPLETE PDU as a guest RW packet.
+    pub fn complete_stream(&mut self, out: CallFrame) -> Result<(VirtioVsockHdr, Vec<u8>), HalError> {
+        self.call_gate().complete(out)?;
+        let (hdr, frame, bounce) = self.take_tx().ok_or(HalError::Fault)?;
+        let pdu = encode_pdu(hdr, frame, &bounce);
+        let conn = self.conn.as_ref().ok_or(HalError::NotFound)?;
+        let (vh, _) = conn.wrap_rw(&pdu);
+        Ok((vh, pdu))
+    }
+
     pub fn import_arg(&mut self, offset: u64, len: usize) -> Result<u64, HalError> {
         if offset % (MSG_ARG_ALIGN as u64) != 0 {
             return Err(HalError::BadAlignment);
@@ -382,6 +427,8 @@ impl Hal for VirtHal {
             entropy: VirtEntropy,
             huk: VirtHuk { bytes: *b"RUSTEE-VIRT-DEV-HUK-NOT-SECRET!!" },
             shms: [(); 32].map(|_| None),
+            listener: VsockListener::default(),
+            conn: None,
         })
     }
     fn new_address_space(&mut self) -> Self::AddressSpace { VirtAs { mapped: 0 } }
@@ -517,5 +564,81 @@ mod tests {
         assert_eq!(VSOCK_GUEST_CID, 3);
         assert_eq!(VSOCK_PORT, 7007);
         assert!(virt.monotonic().is_none());
+        assert_eq!(VIRTIO_PCI_VENDOR, 0x1af4);
+        assert_eq!(VIRTIO_PCI_DEVICE_VSOCK, 0x1053);
+    }
+
+    fn host_request(src_port: u32) -> VirtioVsockHdr {
+        VirtioVsockHdr {
+            src_cid: 2,
+            dst_cid: VSOCK_GUEST_CID as u64,
+            src_port,
+            dst_port: VSOCK_PORT,
+            len: 0,
+            ty: VIRTIO_VSOCK_TYPE_STREAM,
+            op: VIRTIO_VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc: 64 * 1024,
+            fwd_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn virtio_vsock_listen_accept_cid3_port7007() {
+        let mut h = VirtHal::new();
+        h.listen_vsock();
+        let req = host_request(4242);
+        let resp = h.accept_connect(&req).unwrap();
+        assert_eq!(resp.op, VIRTIO_VSOCK_OP_RESPONSE);
+        assert_eq!(resp.src_cid, 3);
+        assert_eq!(resp.src_port, 7007);
+        assert_eq!(resp.dst_cid, 2);
+        assert_eq!(resp.dst_port, 4242);
+        let mut bad = req;
+        bad.dst_port = 9;
+        assert!(h.accept_connect(&bad).is_err());
+    }
+
+    #[test]
+    fn virtio_vsock_enter_complete_on_rw() {
+        let mut h = VirtHal::new();
+        h.listen_vsock();
+        let req = host_request(9);
+        h.accept_connect(&req).unwrap();
+        let cookie: u64 = 0x2000;
+        let mut frame = CallFrame { r: [0x10, 0, 0, 0, 0, 0, 0, 0] };
+        frame.set_cookie_a1a2(cookie);
+        let msg = b"hello-rs";
+        let hdr = PduHeader {
+            kind: KIND_ENTER,
+            seq: 1,
+            arg_len: 64,
+            bounce_len: msg.len() as u32,
+        };
+        let pdu = encode_pdu(hdr, frame, msg);
+        let host_rw = VirtioVsockHdr {
+            src_cid: 2,
+            dst_cid: 3,
+            src_port: 9,
+            dst_port: 7007,
+            len: pdu.len() as u32,
+            ty: VIRTIO_VSOCK_TYPE_STREAM,
+            op: VIRTIO_VSOCK_OP_RW,
+            flags: 0,
+            buf_alloc: 64 * 1024,
+            fwd_cnt: 0,
+        };
+        h.push_host_rw(&host_rw, &pdu).unwrap();
+        let got = h.recv_enter().unwrap();
+        assert_eq!(got.cookie_a1a2(), cookie);
+        assert_eq!(h.bounce_at(cookie, msg.len()).unwrap(), msg);
+        let (out_hdr, out_pdu) = h.complete_stream(got).unwrap();
+        assert_eq!(out_hdr.op, VIRTIO_VSOCK_OP_RW);
+        assert_eq!(out_hdr.src_cid, 3);
+        assert_eq!(out_hdr.src_port, 7007);
+        let decoded = PduHeader::decode(&out_pdu).unwrap();
+        assert_eq!(decoded.kind, KIND_COMPLETE);
+        assert_eq!(decoded.arg_len, 64);
+        assert_eq!(decoded.seq, 1);
     }
 }
