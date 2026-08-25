@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 use rustee_crypto::{hkdf_sha256, AesKey, CryptoError, SoftwareProvider};
 use rustee_hal::{Entropy, Huk};
 
+mod rpc;
+pub use rpc::{FsClient, RpcFs};
+
 pub const MAX_OBJECT: usize = 1024 * 1024;
 pub const STORAGE_CLASS_REE_FS: u8 = 0;
 
@@ -537,34 +540,48 @@ fn hex32(b: &[u8; 16]) -> String {
     s
 }
 
+/// In-memory whole-file backend. Tests and early bring-up. Not the live supplicant.
+#[derive(Default)]
+pub struct MemFs {
+    files: alloc::collections::BTreeMap<String, Vec<u8>>,
+}
+
+impl MemFs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl FsRpc for MemFs {
+    fn create(&mut self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.files.insert(path.into(), data.to_vec());
+        Ok(())
+    }
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, StorageError> {
+        self.files.get(path).cloned().ok_or(StorageError::NotFound)
+    }
+    fn write(&mut self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.files.insert(path.into(), data.to_vec());
+        Ok(())
+    }
+    fn delete(&mut self, path: &str) -> Result<(), StorageError> {
+        self.files.remove(path);
+        Ok(())
+    }
+    fn mkdir(&mut self, _path: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use alloc::collections::BTreeMap;
     use rustee_hal::{Entropy, EntropyOrigin, Huk};
-
-    struct Mem(BTreeMap<String, Vec<u8>>);
-    impl FsRpc for Mem {
-        fn create(&mut self, path: &str, data: &[u8]) -> Result<(), StorageError> {
-            self.0.insert(path.into(), data.to_vec());
-            Ok(())
-        }
-        fn read(&mut self, path: &str) -> Result<Vec<u8>, StorageError> {
-            self.0.get(path).cloned().ok_or(StorageError::NotFound)
-        }
-        fn write(&mut self, path: &str, data: &[u8]) -> Result<(), StorageError> {
-            self.0.insert(path.into(), data.to_vec());
-            Ok(())
-        }
-        fn delete(&mut self, path: &str) -> Result<(), StorageError> {
-            self.0.remove(path);
-            Ok(())
-        }
-        fn mkdir(&mut self, _path: &str) -> Result<(), StorageError> {
-            Ok(())
-        }
-    }
-
+    use rustee_proto::{
+        RPC_FS_CLOSE, RPC_FS_CREATE, RPC_FS_OPEN, RPC_FS_READ, RPC_FS_REMOVE, RPC_FS_TRUNCATE,
+        RPC_FS_WRITE,
+    };
     struct Ctr(u8);
     impl Entropy for Ctr {
         fn fill(&mut self, buf: &mut [u8]) {
@@ -586,11 +603,11 @@ mod tests {
 
     #[test]
     fn create_list_open() {
-        let mut fs = ReeFs::new(Ctr(1), TestHuk, Mem(BTreeMap::new()));
+        let mut fs = ReeFs::new(Ctr(1), TestHuk, MemFs::new());
         let ta = [9u8; 16];
         let h = fs.create(ta, b"oid-1", 0, b"hello").unwrap();
         let mut buf = [0u8; 8];
-        let n = ReeFs::<Ctr, TestHuk, Mem>::read(&h, 0, &mut buf).unwrap();
+        let n = ReeFs::<Ctr, TestHuk, MemFs>::read(&h, 0, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
         let list = fs.list(ta).unwrap();
         assert_eq!(list.len(), 1);
@@ -603,11 +620,104 @@ mod tests {
 
     #[test]
     fn too_big() {
-        let mut fs = ReeFs::new(Ctr(1), TestHuk, Mem(BTreeMap::new()));
+        let mut fs = ReeFs::new(Ctr(1), TestHuk, MemFs::new());
         let data = vec![0u8; MAX_OBJECT + 1];
         assert_eq!(
             fs.create([1u8; 16], b"x", 0, &data).unwrap_err(),
             StorageError::TooBig
         );
+    }
+
+    struct FdMem {
+        files: alloc::collections::BTreeMap<String, Vec<u8>>,
+        fds: alloc::collections::BTreeMap<u32, String>,
+        next: u32,
+    }
+    impl FdMem {
+        fn new() -> Self {
+            Self {
+                files: alloc::collections::BTreeMap::new(),
+                fds: alloc::collections::BTreeMap::new(),
+                next: 1,
+            }
+        }
+    }
+    impl FsClient for FdMem {
+        fn rpc_fs(
+            &mut self,
+            op: u32,
+            name: &str,
+            fd: u32,
+            off: u32,
+            data: &[u8],
+        ) -> Result<(u32, Vec<u8>), StorageError> {
+            match op {
+                RPC_FS_CREATE => {
+                    self.files.entry(name.into()).or_insert_with(Vec::new);
+                    let id = self.next;
+                    self.next += 1;
+                    self.fds.insert(id, name.into());
+                    Ok((id, Vec::new()))
+                }
+                RPC_FS_OPEN => {
+                    if !self.files.contains_key(name) {
+                        return Err(StorageError::NotFound);
+                    }
+                    let id = self.next;
+                    self.next += 1;
+                    self.fds.insert(id, name.into());
+                    Ok((id, Vec::new()))
+                }
+                RPC_FS_CLOSE => {
+                    self.fds.remove(&fd);
+                    Ok((0, Vec::new()))
+                }
+                RPC_FS_READ => {
+                    let path = self.fds.get(&fd).ok_or(StorageError::NotFound)?;
+                    let file = self.files.get(path).ok_or(StorageError::NotFound)?;
+                    let start = off as usize;
+                    if start >= file.len() {
+                        return Ok((0, Vec::new()));
+                    }
+                    let n = core::cmp::min(data.len().max(1), file.len() - start);
+                    Ok((n as u32, file[start..start + n].to_vec()))
+                }
+                RPC_FS_WRITE => {
+                    let path = self.fds.get(&fd).ok_or(StorageError::NotFound)?.clone();
+                    let file = self.files.entry(path).or_default();
+                    let start = off as usize;
+                    if file.len() < start + data.len() {
+                        file.resize(start + data.len(), 0);
+                    }
+                    file[start..start + data.len()].copy_from_slice(data);
+                    Ok((data.len() as u32, Vec::new()))
+                }
+                RPC_FS_TRUNCATE => {
+                    let path = self.fds.get(&fd).ok_or(StorageError::NotFound)?.clone();
+                    let file = self.files.entry(path).or_default();
+                    file.resize(off as usize, 0);
+                    Ok((0, Vec::new()))
+                }
+                RPC_FS_REMOVE => {
+                    self.files.remove(name);
+                    Ok((0, Vec::new()))
+                }
+                _ => Err(StorageError::Fs),
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_fs_ree_roundtrip() {
+        let mut fs = ReeFs::new(Ctr(1), TestHuk, RpcFs::new(FdMem::new()));
+        let ta = [3u8; 16];
+        fs.create(ta, b"oid-rpc", 0, b"through-rpc").unwrap();
+        let list = fs.list(ta).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].object_id, b"oid-rpc");
+        let h = fs.open(ta, b"oid-rpc").unwrap();
+        assert_eq!(h.data, b"through-rpc");
+        fs.delete(ta, b"oid-rpc").unwrap();
+        assert!(fs.open(ta, b"oid-rpc").is_err());
     }
 }

@@ -107,6 +107,17 @@ pub trait PersistentStore {
     fn list(&mut self, ta: [u8; 16]) -> Result<Vec<ObjectMeta>, StorageError>;
 }
 
+impl<E, H, F> PersistentStore for rustee_storage::ReeFs<E, H, F>
+where
+    E: rustee_hal::Entropy,
+    H: rustee_hal::Huk,
+    F: rustee_storage::FsRpc,
+{
+    fn list(&mut self, ta: [u8; 16]) -> Result<Vec<ObjectMeta>, StorageError> {
+        rustee_storage::ReeFs::list(self, ta)
+    }
+}
+
 pub struct Core {
     pub heap: Heap,
     pub prop: PropCtx,
