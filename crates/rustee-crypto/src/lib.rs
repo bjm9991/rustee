@@ -361,12 +361,45 @@ mod tests {
             &digest,
             &sig[..n]
         ));
+        {
+            use rsa::BigUint;
+            use rsa::pkcs8::EncodePublicKey;
+            let rsa_pk = rsa::RsaPublicKey::new(
+                BigUint::from_bytes_be(&pk.n),
+                BigUint::from_bytes_be(&pk.e),
+            )
+            .unwrap();
+            let spki = rsa_pk.to_public_key_der().unwrap();
+            assert!(spki.as_bytes().first() == Some(&0x30));
+            assert!(CryptoProvider::rsa_pkcs1_verify(
+                &p,
+                spki.as_bytes(),
+                &digest,
+                &sig[..n]
+            ));
+        }
         let pt = b"oaep-payload";
         let mut ct = alloc::vec![0u8; 256];
         let cl = p.rsa_oaep_encrypt(&pk, pt, &mut ct, &mut rng).unwrap();
         let mut out = [0u8; 64];
         let ol = p.rsa_oaep_decrypt(&sk, &ct[..cl], &mut out).unwrap();
         assert_eq!(&out[..ol], pt);
+    }
+
+    #[test]
+    fn v0_dev_spki_pkcs1_verify() {
+        // Public SPKI from rustee-os #6. Private key is not in this crate.
+        let p = SoftwareProvider;
+        let spki = include_bytes!("../testdata/v0-dev.spki.der");
+        let sig = include_bytes!("../testdata/v0-dev-digest.sig");
+        assert_eq!(spki.len(), 294);
+        assert_eq!(spki[0], 0x30);
+        assert!(parse_rsa_public(spki).is_ok());
+        let digest = p.sha256(b"digest");
+        assert!(CryptoProvider::rsa_pkcs1_verify(&p, spki, &digest, sig));
+        let mut bad = *sig;
+        bad[0] ^= 1;
+        assert!(!CryptoProvider::rsa_pkcs1_verify(&p, spki, &digest, &bad));
     }
 
     #[test]
