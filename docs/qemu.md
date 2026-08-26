@@ -20,7 +20,8 @@ host/run-qemu.sh target/aarch64-unknown-none/debug/rustee-guest
 Then:
 
 ```
-RUSTEE_HELLO_TA=/path/to/hello-rs.ta \
+./ta/hello-rs/build-ta.sh
+RUSTEE_HELLO_TA=$PWD/target/hello-rs.ta \
 RUSTEE_SUPP_ROOT=/tmp/rustee-supp \
   cargo run -p rustee-smoke --bin hello-ca
 ```
@@ -28,3 +29,5 @@ RUSTEE_SUPP_ROOT=/tmp/rustee-supp \
 `hello-ca` stages `$RUSTEE_SUPP_ROOT/ta/8d825f6a1c4b4c9f9e3a2b7c6d5e4f30.ta` (copy from `RUSTEE_HELLO_TA` if the file is missing), opens hello-rs, invokes cmd 0 (memref 0 → 1), checks the shm copy of `hello-rs`.
 
 OpenSession yields `LOAD_TA`. Guest packs it at bounce cookie `0x80_0000`, param 1 `TMEM_OUTPUT` dest cookie+96, cap 2 MiB. The supplicant copies the ELF at `params[1].a` (pool offset, not a VA) and RPC_REPLY `bounce_len` covers dest plus the ELF. `rustee-virt.ko` still does not answer `KIND_RPC`; v0 live path is userspace `StreamTransport`.
+
+The `.ta` is a **raw aarch64 ELF** (`cargo build -p hello-rs --target aarch64-unknown-none --release` plus `rust-lld -T ta/hello-rs/link.ld`). It has `.rustee.ta_head` (RTAH) and the five `TA_*` symbols. Do not wrap RTSG (kernel load format; the TA link does not emit it). See [ta/hello-rs/README.md](../ta/hello-rs/README.md).

@@ -1,0 +1,4 @@
+# Guest and TA images: aarch64-unknown-none (tier 2). panic=abort; no unwind.
+# Per-crate linker scripts are supplied by build.rs (hello-rs: ta/hello-rs/link.ld).
+[target.aarch64-unknown-none]
+rustflags = ["-C", "panic=abort"]
