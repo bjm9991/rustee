@@ -2,8 +2,8 @@
 use std::io::{Read, Write};
 
 use rustee_proto::{
-    CallFrame, PduHeader, CALL_FRAME_LEN, KIND_COMPLETE, KIND_ENTER, KIND_RPC, KIND_RPC_REPLY,
-    PDU_HDR_LEN, VSOCK_GUEST_CID, VSOCK_PORT,
+    decode_msg, write_msg, CallFrame, PduHeader, CALL_FRAME_LEN, KIND_COMPLETE, KIND_ENTER,
+    KIND_RPC, KIND_RPC_REPLY, PDU_HDR_LEN, VSOCK_GUEST_CID, VSOCK_PORT,
 };
 
 use crate::{TEEC_ERROR_BUSY, TEEC_ERROR_COMMUNICATION};
@@ -79,6 +79,16 @@ pub fn read_pdu(r: &mut impl Read, bounce: &mut [u8]) -> Result<(PduHeader, Call
     Ok((hdr, frame))
 }
 
+/// Guest is parked on ENTER until RPC_REPLY. `hdr.ret == 0` is success; never omit the reply.
+fn stamp_rpc_ret(bounce: &mut [u8], cookie: u64, ret: u32) {
+    let ret = if ret == 0 { TEEC_ERROR_COMMUNICATION } else { ret };
+    if let Ok((mut hdr, params, _)) = decode_msg(bounce, cookie) {
+        hdr.ret = ret;
+        let n = hdr.num_params as usize;
+        let _ = write_msg(bounce, cookie, hdr, &params[..n]);
+    }
+}
+
 impl<S: Read + Write> crate::Transport for StreamTransport<S> {
     fn enter(
         &mut self,
@@ -103,9 +113,10 @@ impl<S: Read + Write> crate::Transport for StreamTransport<S> {
                 KIND_RPC => {
                     let mut reply_len = hdr.bounce_len;
                     if let Some(h) = self.on_rpc {
-                        let n = h(bounce, out.cookie())?;
-                        if n > 0 {
-                            reply_len = n;
+                        match h(bounce, out.cookie()) {
+                            Ok(n) if n > 0 => reply_len = n,
+                            Ok(_) => {}
+                            Err(code) => stamp_rpc_ret(bounce, out.cookie(), code),
                         }
                     }
                     write_pdu(
@@ -257,5 +268,56 @@ mod tests {
             .enter(CallFrame::default(), &mut bounce, 16)
             .unwrap_err();
         assert_eq!(err, TEEC_ERROR_BUSY);
+    }
+
+    fn fail_rpc(_b: &mut [u8], _c: u64) -> Result<u32, u32> {
+        Err(0xFFFF_0008)
+    }
+
+    #[test]
+    fn rpc_error_still_sends_reply() {
+        use rustee_proto::{write_msg, MsgArgHdr, MsgParam, RPC_CMD_LOAD_TA};
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let mut host = StreamTransport::new(client);
+        host.on_rpc = Some(fail_rpc);
+        std::thread::spawn(move || {
+            let mut bounce = vec![0u8; 256];
+            let (hdr, frame) = read_pdu(&mut server, &mut bounce).unwrap();
+            assert_eq!(hdr.kind, KIND_ENTER);
+            let cookie = frame.cookie();
+            let msg = MsgArgHdr {
+                cmd: RPC_CMD_LOAD_TA,
+                num_params: 1,
+                ..MsgArgHdr::default()
+            };
+            write_msg(&mut bounce, cookie, msg, &[MsgParam::default()]).unwrap();
+            write_pdu(
+                &mut server,
+                KIND_RPC,
+                hdr.seq,
+                frame,
+                &bounce,
+                hdr.bounce_len,
+            )
+            .unwrap();
+            let (rh, _) = read_pdu(&mut server, &mut bounce).unwrap();
+            assert_eq!(rh.kind, KIND_RPC_REPLY);
+            let (out, _, _) = rustee_proto::decode_msg(&bounce, cookie).unwrap();
+            assert_eq!(out.ret, 0xFFFF_0008);
+            write_pdu(
+                &mut server,
+                KIND_COMPLETE,
+                hdr.seq,
+                frame,
+                &bounce,
+                hdr.bounce_len,
+            )
+            .unwrap();
+        });
+        let mut bounce = vec![0u8; 256];
+        let mut frame = CallFrame::default();
+        frame.r[0] = SMC_CALL_WITH_ARG as u64;
+        frame.set_cookie(64);
+        let _ = host.enter(frame, &mut bounce, 96).unwrap();
     }
 }
