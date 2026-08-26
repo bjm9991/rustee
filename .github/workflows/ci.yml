@@ -1,9 +1,11 @@
-# v0 required host gate: cargo test --workspace on every PR and every push to main.
+# v0 required gates on every PR and every push to main:
+#   1. cargo test --workspace
+#   2. QEMU hello-ca (host/run-qemu.sh + tests/smoke hello-ca)
 # Rust version comes from rust-toolchain.toml (stable).
-# Do not add --all-features. Do not inject RUSTFLAGS=-D warnings; the gate is cargo test.
-# QEMU hello-ca (host/run-qemu.sh + tests/smoke hello-ca, guest aarch64-unknown-none,
-# CID 3:7007, virtio-rng) is a later job once a guest ELF exists. Do not use
-# virt,secure=on. Do not vendor OP-TEE. No TrustZone hardware.
+# Do not add --all-features. Do not inject RUSTFLAGS=-D warnings; the host
+# gate is cargo test --workspace.
+# Guest target is aarch64-unknown-none. CID 3:7007, virtio-rng.
+# Do not use virt,secure=on. Do not vendor OP-TEE. No TrustZone hardware.
 name: CI
 
 on:
@@ -34,11 +36,11 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
   qemu-smoke:
-    name: QEMU hello-ca (non-blocking)
+    name: QEMU hello-ca
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -54,11 +56,16 @@ jobs:
 
       - name: Enable vhost-vsock
         run: |
-          set -x
-          sudo modprobe vhost_vsock || true
-          ls -l /dev/vhost-vsock || true
+          set -euo pipefail
+          sudo modprobe vhost_vsock
+          ls -l /dev/vhost-vsock
           sudo chmod 0666 /dev/vhost-vsock || true
-          ls -l /dev/vhost-vsock || true
+          if ! [ -r /dev/vhost-vsock ] || ! [ -w /dev/vhost-vsock ]; then
+            sudo chown "$(id -u):$(id -g)" /dev/vhost-vsock
+          fi
+          ls -l /dev/vhost-vsock
+          test -r /dev/vhost-vsock
+          test -w /dev/vhost-vsock
 
       - name: Build guest ELF
         run: cargo build -p rustee-guest --features boot --target aarch64-unknown-none
