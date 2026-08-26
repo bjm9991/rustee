@@ -37,7 +37,9 @@ pub const KIND_COMPLETE: u32 = 3;
 pub const KIND_RPC_REPLY: u32 = 4;
 pub const MSG_ARG_ALIGN: usize = 8;
 
+mod rng;
 mod vsock;
+pub use rng::{VirtEntropy, VIRTIO_ID_RNG, VIRTIO_PCI_DEVICE_RNG};
 pub use vsock::{
     encode_pdu, read_pdu, VirtioVsockHdr, VsockConn, VsockListener, VIRTIO_PCI_DEVICE_VSOCK,
     VIRTIO_PCI_VENDOR, VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
@@ -208,6 +210,8 @@ impl SharedMem for VirtShm {
 
 pub struct VirtAs {
     mapped: usize,
+    /// Guest VA of bounce pool base. cookie is an offset; map_shm returns base+cookie.
+    pool_va: u64,
 }
 
 impl AddressSpace for VirtAs {
@@ -227,8 +231,13 @@ impl AddressSpace for VirtAs {
         if shm.len() == 0 {
             return Err(HalError::InvalidParam);
         }
+        let start = shm.cookie();
+        let end = start.checked_add(shm.len() as u64).ok_or(HalError::InvalidParam)?;
+        if end as usize > BOUNCE_POOL_SIZE {
+            return Err(HalError::InvalidParam);
+        }
         self.mapped = self.mapped.saturating_add(1);
-        Ok(VirtAddr(shm.cookie()))
+        Ok(VirtAddr(self.pool_va.wrapping_add(start)))
     }
 
     fn unmap(&mut self, _va: VirtAddr) {
@@ -240,18 +249,6 @@ impl AddressSpace for VirtAs {
     }
 }
 
-pub struct VirtEntropy;
-impl Entropy for VirtEntropy {
-    fn fill(&mut self, buf: &mut [u8]) {
-        let mut x: u8 = 0x5a;
-        for b in buf.iter_mut() {
-            x = x.wrapping_mul(17).wrapping_add(1);
-            *b = x;
-        }
-    }
-    fn origin(&self) -> EntropyOrigin { EntropyOrigin::ReeHost }
-}
-
 pub struct VirtHuk { bytes: [u8; 32] }
 impl Huk for VirtHuk {
     fn material(&self) -> &[u8] { &self.bytes }
@@ -261,6 +258,7 @@ pub struct VirtHal {
     gate: VirtCallGate,
     bounce: PhysRegion,
     bounce_mem: Vec<u8>,
+    pool_va: u64,
     entropy: VirtEntropy,
     huk: VirtHuk,
     shms: [Option<VirtShm>; 32],
@@ -286,9 +284,6 @@ impl VirtHal {
         let end = start.checked_add(bounce.len()).ok_or(HalError::InvalidParam)?;
         if end > self.bounce.len {
             return Err(HalError::InvalidParam);
-        }
-        if self.bounce_mem.len() < end {
-            self.bounce_mem.resize(end, 0);
         }
         self.bounce_mem[start..end].copy_from_slice(bounce);
         Ok(())
@@ -341,9 +336,22 @@ impl VirtHal {
         Ok(())
     }
 
-    /// Bind guest CID 3 port 7007. Host rustee-virt.ko connects after this.
+    /// Bind guest CID 3 port 7007. Called from `Hal::init` (boot). Host rustee-virt.ko connects after this.
     pub fn listen_vsock(&mut self) {
         self.listener.listen();
+    }
+
+    pub fn vsock_bound(&self) -> Option<(u32, u32)> {
+        if self.listener.is_listening() {
+            Some((self.listener.cid, self.listener.port))
+        } else {
+            None
+        }
+    }
+
+    /// virtio-rng used buffer. Live QEMU path; tests may call this too.
+    pub fn feed_rng(&mut self, bytes: &[u8]) {
+        self.entropy.complete(bytes);
     }
 
     /// virtio-vsock REQUEST -> RESPONSE. One SOCK_STREAM.
@@ -413,6 +421,9 @@ impl Hal for VirtHal {
         if info.shm_pool.len != BOUNCE_POOL_SIZE {
             return Err(HalError::InvalidParam);
         }
+        let mut bounce_mem = Vec::new();
+        bounce_mem.resize(BOUNCE_POOL_SIZE, 0);
+        let pool_va = bounce_mem.as_ptr() as u64;
         Ok(Self {
             gate: VirtCallGate {
                 yielding: false,
@@ -423,15 +434,22 @@ impl Hal for VirtHal {
                 last_bounce_len: 0,
             },
             bounce: info.shm_pool,
-            bounce_mem: Vec::new(),
-            entropy: VirtEntropy,
+            bounce_mem,
+            pool_va,
+            entropy: VirtEntropy::new(),
             huk: VirtHuk { bytes: *b"RUSTEE-VIRT-DEV-HUK-NOT-SECRET!!" },
             shms: [(); 32].map(|_| None),
-            listener: VsockListener::default(),
+            listener: {
+                let mut l = VsockListener::default();
+                l.listen();
+                l
+            },
             conn: None,
         })
     }
-    fn new_address_space(&mut self) -> Self::AddressSpace { VirtAs { mapped: 0 } }
+    fn new_address_space(&mut self) -> Self::AddressSpace {
+        VirtAs { mapped: 0, pool_va: self.pool_va }
+    }
     fn lookup_shm(&self, cookie: u64) -> Option<&Self::SharedMem> {
         self.shms.iter().filter_map(|s| s.as_ref()).find(|s| s.cookie() == cookie)
     }
@@ -464,6 +482,14 @@ mod tests {
         shm.sync_in().unwrap();
         shm.sync_out().unwrap();
         assert!(h.import_shm(0, 16, Perms::RX).is_err());
+        let mut aspace = h.new_address_space();
+        let shm = h.lookup_shm(0x1000).unwrap();
+        let va = aspace.map_shm(shm, Perms::RW).unwrap();
+        assert_ne!(va.0, 0x1000, "map_shm must not return the cookie as a VA");
+        unsafe {
+            core::ptr::write(va.0 as *mut u8, 0x42);
+        }
+        assert_eq!(h.bounce_at(0x1000, 1).unwrap()[0], 0x42);
     }
 
     #[test]
@@ -546,6 +572,18 @@ mod tests {
         h.entropy().fill(&mut buf);
         assert!(buf.iter().any(|b| *b != 0));
         assert_eq!(h.entropy().origin(), EntropyOrigin::ReeHost);
+        assert_eq!(VIRTIO_ID_RNG, 4);
+        assert_eq!(VIRTIO_PCI_DEVICE_RNG, 0x1044);
+        h.feed_rng(&[0u8; 16]);
+        let mut z = [0u8; 16];
+        h.entropy().fill(&mut z);
+        assert!(z.iter().any(|b| *b != 0));
+    }
+
+    #[test]
+    fn boot_binds_cid3_port7007() {
+        let h = VirtHal::new();
+        assert_eq!(h.vsock_bound(), Some((3, 7007)));
     }
 
     #[test]
