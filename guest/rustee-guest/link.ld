@@ -18,4 +18,6 @@ SECTIONS {
   . = . + 0x10000;
   __stack_start = .;
   __heap_start = ALIGN(0x1000);
+  /* RAM is 256MiB at 0x40000000. */
+  __heap_end = 0x50000000;
 }

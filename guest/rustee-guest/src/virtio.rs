@@ -1,5 +1,6 @@
 //! Minimal virtio-pci modern (common cfg + notify + one split queue).
 use crate::pci::{self, PciDev};
+use alloc::vec::Vec;
 
 const CAP_COMMON: u8 = 1;
 const CAP_NOTIFY: u8 = 2;
@@ -11,16 +12,18 @@ const S_DRIVER: u8 = 2;
 const S_DRIVER_OK: u8 = 4;
 const S_FEATURES_OK: u8 = 8;
 
+const QSIZE: usize = 16;
+
 #[repr(C)]
 struct SplitQ {
-    desc: [Desc; 16],
+    desc: [Desc; QSIZE],
     avail_flags: u16,
     avail_idx: u16,
-    avail_ring: [u16; 16],
+    avail_ring: [u16; QSIZE],
     used_pad: [u8; 4],
     used_flags: u16,
     used_idx: u16,
-    used_ring: [UsedElem; 16],
+    used_ring: [UsedElem; QSIZE],
 }
 
 #[repr(C)]
@@ -43,6 +46,9 @@ pub struct Virtq {
     q: *mut SplitQ,
     last_used: u16,
     notify: *mut u16,
+    /// TX packet buffers. Slot `i` is live while desc `i` is in flight.
+    bufs: [Option<Vec<u8>>; QSIZE],
+    inflight: [bool; QSIZE],
 }
 
 pub struct VirtioPci {
@@ -124,38 +130,39 @@ impl VirtioPci {
     }
 
     pub unsafe fn reset_and_ack(&self) {
-        self.w8(0x14, 0); // device_status (offset in common cfg: after features)
-        // common cfg layout (virtio 1.2):
-        // 0 device_feature_select u32
-        // 4 device_feature u32
-        // 8 driver_feature_select u32
-        // 12 driver_feature u32
-        // 16 msix_config u16
-        // 18 num_queues u16
-        // 20 device_status u8
-        // 21 config_generation u8
+        self.w8(20, 0); // device_status
+                        // common cfg layout (virtio 1.2):
+                        // 0 device_feature_select u32
+                        // 4 device_feature u32
+                        // 8 driver_feature_select u32
+                        // 12 driver_feature u32
+                        // 16 msix_config u16
+                        // 18 num_queues u16
+                        // 20 device_status u8
+                        // 21 config_generation u8
         self.w8(20, S_ACK | S_DRIVER);
+        // Low 32 feature bits: none.
         self.w32(8, 0);
-        self.w32(12, 0); // no extra features
+        self.w32(12, 0);
+        // VIRTIO_F_VERSION_1 is feature bit 32 → word 1, bit 0.
+        self.w32(8, 1);
+        self.w32(12, 1);
         self.w8(20, S_ACK | S_DRIVER | S_FEATURES_OK);
-        let _ = self.r8(20);
+        let st = self.r8(20);
+        if st & S_FEATURES_OK == 0 {
+            crate::uart::fail_halt("virtio FEATURES_OK not sticky (need VIRTIO_F_VERSION_1)");
+        }
     }
 
     pub unsafe fn setup_queue(&self, idx: u16) -> Virtq {
         self.w16(22, idx); // queue_select
-        let size = 16u16;
+        let size = QSIZE as u16;
         self.w16(24, size); // queue_size
         self.w16(26, 0xffff); // no msix
-        let layout = core::alloc::Layout::from_size_align(
-            core::mem::size_of::<SplitQ>(),
-            16,
-        )
-        .unwrap();
+        let layout =
+            core::alloc::Layout::from_size_align(core::mem::size_of::<SplitQ>(), 16).unwrap();
         let q = alloc::alloc::alloc_zeroed(layout) as *mut SplitQ;
         let pa = q as u64;
-        self.w64(32, pa); // queue_desc
-        self.w64(40, pa + 16 * 16); // queue_driver (avail)
-        self.w64(48, pa + 16 * 16 + 4 + 2 + 2 + 32); // approx used — recompute
         // SplitQ layout: desc 16*16=256, avail_flags+idx=4, ring 32, pad 4, used_flags+idx=4, used 16*8=128
         let avail_off = core::mem::offset_of!(SplitQ, avail_flags) as u64;
         let used_off = core::mem::offset_of!(SplitQ, used_flags) as u64;
@@ -165,7 +172,14 @@ impl VirtioPci {
         self.w16(28, 1); // queue_enable
         let n_off = self.r16(30) as u32; // queue_notify_off
         let notify = self.notify.add((n_off * self.notify_off_mul) as usize) as *mut u16;
-        Virtq { q, last_used: 0, notify }
+        const NONE: Option<Vec<u8>> = None;
+        Virtq {
+            q,
+            last_used: 0,
+            notify,
+            bufs: [NONE; QSIZE],
+            inflight: [false; QSIZE],
+        }
     }
 
     pub unsafe fn driver_ok(&self) {
@@ -174,7 +188,45 @@ impl VirtioPci {
 }
 
 impl Virtq {
+    fn cap_id(id: u16) -> u16 {
+        id % (QSIZE as u16)
+    }
+
+    /// Recycle every TX used descriptor. Must be polled so ids 0..16 can be reused.
+    pub unsafe fn recycle_used(&mut self) {
+        while self.poll_used().is_some() {}
+    }
+
+    fn alloc_desc(&mut self) -> Option<u16> {
+        unsafe { self.recycle_used() };
+        for i in 0..QSIZE {
+            if !self.inflight[i] {
+                return Some(i as u16);
+            }
+        }
+        None
+    }
+
+    /// Own `pkt` in a desc slot until the device writes used. No `mem::forget`.
+    pub unsafe fn add_out_owned(&mut self, pkt: Vec<u8>) {
+        let id = loop {
+            if let Some(id) = self.alloc_desc() {
+                break id;
+            }
+            core::hint::spin_loop();
+        };
+        self.bufs[id as usize] = Some(pkt);
+        self.inflight[id as usize] = true;
+        let (ptr, len) = {
+            let buf = self.bufs[id as usize].as_ref().unwrap();
+            (buf.as_ptr(), buf.len() as u32)
+        };
+        self.add_out(ptr, len, id);
+    }
+
     pub unsafe fn add_in(&mut self, buf: *mut u8, len: u32, id: u16) {
+        let id = Self::cap_id(id);
+        self.inflight[id as usize] = true;
         let q = &mut *self.q;
         q.desc[id as usize] = Desc {
             addr: buf as u64,
@@ -183,13 +235,14 @@ impl Virtq {
             next: 0,
         };
         let idx = q.avail_idx;
-        q.avail_ring[(idx % 16) as usize] = id;
+        q.avail_ring[(idx as usize) % QSIZE] = id;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         q.avail_idx = idx.wrapping_add(1);
         core::ptr::write_volatile(self.notify, 0);
     }
 
     pub unsafe fn add_out(&mut self, buf: *const u8, len: u32, id: u16) {
+        let id = Self::cap_id(id);
         let q = &mut *self.q;
         q.desc[id as usize] = Desc {
             addr: buf as u64,
@@ -198,7 +251,7 @@ impl Virtq {
             next: 0,
         };
         let idx = q.avail_idx;
-        q.avail_ring[(idx % 16) as usize] = id;
+        q.avail_ring[(idx as usize) % QSIZE] = id;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         q.avail_idx = idx.wrapping_add(1);
         core::ptr::write_volatile(self.notify, 0);
@@ -210,9 +263,12 @@ impl Virtq {
         if q.used_idx == self.last_used {
             return None;
         }
-        let e = q.used_ring[(self.last_used % 16) as usize];
+        let e = q.used_ring[(self.last_used as usize) % QSIZE];
         self.last_used = self.last_used.wrapping_add(1);
-        Some((e.id as u16, e.len))
+        let id = (e.id as u16) % (QSIZE as u16);
+        self.inflight[id as usize] = false;
+        // Keep bufs[id] allocated for reuse; drop only when replaced in add_out_owned.
+        Some((id, e.len))
     }
 }
 

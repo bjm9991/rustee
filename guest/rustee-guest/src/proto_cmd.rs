@@ -3,10 +3,10 @@ use rustee_os::{
     Dir, KernelCmd, Login, MemrefSrc, Param, SessionId, Uuid, PARAM_COUNT, TEE_TIMEOUT_INFINITE,
 };
 use rustee_proto::{
-    decode_msg, MsgArgHdr, MsgParam, ATTR_META, ATTR_TYPE_MASK, ATTR_TYPE_NONE, ATTR_TYPE_TMEM_INOUT,
-    ATTR_TYPE_TMEM_INPUT, ATTR_TYPE_TMEM_OUTPUT, ATTR_TYPE_VALUE_INOUT, ATTR_TYPE_VALUE_INPUT,
-    ATTR_TYPE_VALUE_OUTPUT, MSG_CMD_CANCEL, MSG_CMD_CLOSE_SESSION, MSG_CMD_INVOKE_COMMAND,
-    MSG_CMD_OPEN_SESSION, MSG_LOGIN_PUBLIC,
+    decode_msg, MsgArgHdr, MsgParam, ATTR_META, ATTR_TYPE_MASK, ATTR_TYPE_NONE,
+    ATTR_TYPE_TMEM_INOUT, ATTR_TYPE_TMEM_INPUT, ATTR_TYPE_TMEM_OUTPUT, ATTR_TYPE_VALUE_INOUT,
+    ATTR_TYPE_VALUE_INPUT, ATTR_TYPE_VALUE_OUTPUT, MSG_CMD_CANCEL, MSG_CMD_CLOSE_SESSION,
+    MSG_CMD_INVOKE_COMMAND, MSG_CMD_OPEN_SESSION, MSG_LOGIN_PUBLIC,
 };
 
 fn ty(p: MsgParam) -> u64 {
@@ -41,13 +41,21 @@ fn param(p: MsgParam) -> Param {
     }
 }
 
+/// Inverse of gp-client `Uuid::words`: hi = (time_low<<32)|(time_mid<<16)|time_hi,
+/// lo = clock_seq_and_node packed big-endian. Bytes match `Uuid::from_bytes`.
 fn uuid_from_words(hi: u64, lo: u64) -> Uuid {
+    let time_low = (hi >> 32) as u32;
+    let time_mid = (hi >> 16) as u16;
+    let time_hi = hi as u16;
     let mut b = [0u8; 16];
-    b[0..8].copy_from_slice(&hi.to_be_bytes());
+    b[0..4].copy_from_slice(&time_low.to_be_bytes());
+    b[4..6].copy_from_slice(&time_mid.to_be_bytes());
+    b[6..8].copy_from_slice(&time_hi.to_be_bytes());
     b[8..16].copy_from_slice(&lo.to_be_bytes());
     Uuid(b)
 }
 
+/// Decode MSG in place from the live bounce slice. `pool` is the bounce, not a clone.
 pub fn decode_cmd(pool: &[u8], cookie: u64) -> Result<KernelCmd, ()> {
     let (hdr, params, _) = decode_msg(pool, cookie).map_err(|_| ())?;
     match hdr.cmd {

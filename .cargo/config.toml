@@ -1,5 +1,0 @@
-[target.aarch64-unknown-none]
-rustflags = [
-  "-C", "link-arg=-Tguest/rustee-guest/link.ld",
-  "-C", "panic=abort",
-]

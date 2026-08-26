@@ -337,7 +337,9 @@ impl VirtHal {
         if offset % (MSG_ARG_ALIGN as u64) != 0 {
             return Err(HalError::BadAlignment);
         }
-        if self.shms.iter().flatten().any(|s| s.cookie() == offset) {
+        if let Some(s) = self.shms.iter_mut().flatten().find(|s| s.cookie() == offset) {
+            s.len = len;
+            s.perms = perms;
             return Ok(());
         }
         let slot = self.shms.iter_mut().find(|s| s.is_none()).ok_or(HalError::NoMemory)?;
@@ -504,6 +506,16 @@ mod tests {
             core::ptr::write(va.0 as *mut u8, 0x42);
         }
         assert_eq!(h.bounce_at(0x1000, 1).unwrap()[0], 0x42);
+    }
+
+    #[test]
+    fn import_shm_duplicate_updates_len_perms() {
+        let mut h = VirtHal::new();
+        h.import_shm(0x1000, 0x1000, Perms::READ).unwrap();
+        h.import_shm(0x1000, 0x2000, Perms::RW).unwrap();
+        let s = h.lookup_shm(0x1000).unwrap();
+        assert_eq!(s.len(), 0x2000);
+        assert_eq!(s.perms(), Perms::RW);
     }
 
     #[test]
