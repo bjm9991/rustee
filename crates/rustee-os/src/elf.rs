@@ -159,3 +159,42 @@ fn str_name(tab: &[u8], off: usize) -> Option<&str> {
 pub fn _section_name() -> &'static str {
     SECTION_NAME
 }
+
+use crate::abi::TaEntryPoints;
+use rustee_hal::{AddressSpace, HalError, Perms, VirtAddr};
+
+/// Map PT_LOAD into the TA aspace. On aarch64, bind GP TA_* VAs as entry points.
+pub fn map_elf<A: AddressSpace>(aspace: &mut A, bytes: &[u8]) -> Result<Option<TaEntryPoints>, u32> {
+    let img = parse_elf(bytes)?;
+    for seg in &img.segs {
+        let end = seg.file_off.saturating_add(seg.file_size);
+        let src = bytes.get(seg.file_off..end).ok_or(TEE_ERROR_BAD_PARAMETERS)?;
+        let perms = if seg.exec { Perms::RX } else { Perms::RW };
+        aspace
+            .map_image(VirtAddr(seg.va), src, perms)
+            .map_err(|_| TEE_ERROR_BAD_PARAMETERS)?;
+    }
+    Ok(bind_symbols(img.symbols))
+}
+
+fn bind_symbols(symbols: Option<TaSymbols>) -> Option<TaEntryPoints> {
+    let s = symbols?;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return Some(TaEntryPoints {
+            create: core::mem::transmute(s.create as usize),
+            destroy: core::mem::transmute(s.destroy as usize),
+            open_session: core::mem::transmute(s.open_session as usize),
+            close_session: core::mem::transmute(s.close_session as usize),
+            invoke: core::mem::transmute(s.invoke as usize),
+        });
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = s;
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn _hal_error(_: HalError) {}
