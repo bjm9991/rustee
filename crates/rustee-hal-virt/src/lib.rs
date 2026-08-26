@@ -264,6 +264,9 @@ pub struct VirtHal {
     shms: [Option<VirtShm>; 32],
     listener: VsockListener,
     conn: Option<VsockConn>,
+    /// OpenSession ENTER window. COMPLETE uses this after RPC_REPLY, not the RPC cookie.
+    enter_cookie: u64,
+    enter_bounce_len: u32,
 }
 
 impl VirtHal {
@@ -321,6 +324,12 @@ impl VirtHal {
         self.bounce_mem.get(start..end)
     }
 
+    pub fn bounce_at_mut(&mut self, cookie: u64, len: usize) -> Option<&mut [u8]> {
+        let start = cookie as usize;
+        let end = start.checked_add(len)?;
+        self.bounce_mem.get_mut(start..end)
+    }
+
     pub fn import_shm(&mut self, offset: u64, len: usize, perms: Perms) -> Result<(), HalError> {
         if perms.exec {
             return Err(HalError::PermDenied);
@@ -328,8 +337,13 @@ impl VirtHal {
         if (offset as usize) + len > self.bounce.len {
             return Err(HalError::InvalidParam);
         }
-        if offset % (PAGE_SIZE as u64) != 0 || len % PAGE_SIZE != 0 {
+        if offset % (MSG_ARG_ALIGN as u64) != 0 {
             return Err(HalError::BadAlignment);
+        }
+        if let Some(s) = self.shms.iter_mut().flatten().find(|s| s.cookie() == offset) {
+            s.len = len;
+            s.perms = perms;
+            return Ok(());
         }
         let slot = self.shms.iter_mut().find(|s| s.is_none()).ok_or(HalError::NoMemory)?;
         *slot = Some(VirtShm { cookie: offset, len, perms });
@@ -375,7 +389,40 @@ impl VirtHal {
         self.call_gate().recv()
     }
 
+    /// Point `rpc_yield` / `take_tx` at the LOAD_TA bounce window. Saves the ENTER
+    /// cookie/`bounce_len` so COMPLETE still uses the OpenSession MSG.
+    pub fn set_rpc_window(&mut self, cookie: u64, bounce_len: u32) {
+        self.enter_cookie = self.gate.last_cookie;
+        self.enter_bounce_len = self.gate.last_bounce_len;
+        self.gate.last_cookie = cookie;
+        self.gate.last_bounce_len = bounce_len;
+    }
+
+    /// Read KIND_RPC_REPLY from the accepted stream. Copies bounce at the reply cookie,
+    /// clears `yielding`, does not queue tx. Restores the ENTER window for COMPLETE.
+    /// Do not call `rpc_yield` to consume the reply — that would queue a second KIND_RPC.
+    pub fn recv_rpc_reply(&mut self) -> Result<CallFrame, HalError> {
+        let (hdr, frame, bounce) = {
+            let conn = self.conn.as_mut().ok_or(HalError::NotFound)?;
+            read_pdu(conn)?
+        };
+        if hdr.kind != KIND_RPC_REPLY || hdr.arg_len != CALL_FRAME_LEN as u32 {
+            return Err(HalError::InvalidParam);
+        }
+        self.feed_pdu(hdr, frame, &bounce)?;
+        let _ = self.gate.rx.take();
+        self.gate.yielding = false;
+        self.gate.last_cookie = self.enter_cookie;
+        self.gate.last_bounce_len = self.enter_bounce_len;
+        Ok(frame)
+    }
+
     /// CallGate complete, then wrap COMPLETE PDU as a guest RW packet.
+    pub fn wrap_outgoing(&self, payload: &[u8]) -> Result<VirtioVsockHdr, HalError> {
+        let conn = self.conn.as_ref().ok_or(HalError::NotFound)?;
+        Ok(conn.wrap_rw(payload).0)
+    }
+
     pub fn complete_stream(&mut self, out: CallFrame) -> Result<(VirtioVsockHdr, Vec<u8>), HalError> {
         self.call_gate().complete(out)?;
         let (hdr, frame, bounce) = self.take_tx().ok_or(HalError::Fault)?;
@@ -439,6 +486,8 @@ impl Hal for VirtHal {
             entropy: VirtEntropy::new(),
             huk: VirtHuk { bytes: *b"RUSTEE-VIRT-DEV-HUK-NOT-SECRET!!" },
             shms: [(); 32].map(|_| None),
+            enter_cookie: 0,
+            enter_bounce_len: 0,
             listener: {
                 let mut l = VsockListener::default();
                 l.listen();
@@ -491,6 +540,16 @@ mod tests {
             core::ptr::write(va.0 as *mut u8, 0x42);
         }
         assert_eq!(h.bounce_at(0x1000, 1).unwrap()[0], 0x42);
+    }
+
+    #[test]
+    fn import_shm_duplicate_updates_len_perms() {
+        let mut h = VirtHal::new();
+        h.import_shm(0x1000, 0x1000, Perms::READ).unwrap();
+        h.import_shm(0x1000, 0x2000, Perms::RW).unwrap();
+        let s = h.lookup_shm(0x1000).unwrap();
+        assert_eq!(s.len(), 0x2000);
+        assert_eq!(s.perms(), Perms::RW);
     }
 
     #[test]
@@ -679,5 +738,100 @@ mod tests {
         assert_eq!(decoded.kind, KIND_COMPLETE);
         assert_eq!(decoded.arg_len, 64);
         assert_eq!(decoded.seq, 1);
+    }
+
+    fn host_rw(src_port: u32, pdu: &[u8]) -> VirtioVsockHdr {
+        VirtioVsockHdr {
+            src_cid: 2,
+            dst_cid: 3,
+            src_port,
+            dst_port: 7007,
+            len: pdu.len() as u32,
+            ty: VIRTIO_VSOCK_TYPE_STREAM,
+            op: VIRTIO_VSOCK_OP_RW,
+            flags: 0,
+            buf_alloc: 64 * 1024,
+            fwd_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn rpc_window_reply_complete_keeps_enter_cookie() {
+        let mut h = VirtHal::new();
+        h.listen_vsock();
+        h.accept_connect(&host_request(9)).unwrap();
+
+        let enter_cookie: u64 = 0x1000;
+        let enter_bounce = b"opensession-msg";
+        let mut enter = CallFrame { r: [0x3200_0004, 0, 0, 0, 0, 0, 0, 0] };
+        enter.set_cookie_a1a2(enter_cookie);
+        let enter_pdu = encode_pdu(
+            PduHeader {
+                kind: KIND_ENTER,
+                seq: 1,
+                arg_len: 64,
+                bounce_len: enter_bounce.len() as u32,
+            },
+            enter,
+            enter_bounce,
+        );
+        h.push_host_rw(&host_rw(9, &enter_pdu), &enter_pdu).unwrap();
+        let got = h.recv_enter().unwrap();
+        assert_eq!(got.cookie_a1a2(), enter_cookie);
+
+        let rpc_cookie: u64 = 0x80_0000;
+        let rpc_bounce_len: u32 = 128;
+        if let Some(buf) = h.bounce_at_mut(rpc_cookie, 8) {
+            buf.copy_from_slice(b"rpc-load");
+        }
+        h.set_rpc_window(rpc_cookie, rpc_bounce_len);
+        let mut rpc_frame = CallFrame { r: [0, 0, 0, 0, 0, 0, 0, 0] };
+        rpc_frame.set_cookie_a1a2(rpc_cookie);
+        assert!(matches!(
+            h.call_gate().rpc_yield(rpc_frame),
+            Err(HalError::NotFound)
+        ));
+        assert!(matches!(h.call_gate().recv(), Err(HalError::Busy)));
+        let (th, tf, tb) = h.take_tx().unwrap();
+        assert_eq!(th.kind, KIND_RPC);
+        assert_eq!(th.bounce_len, rpc_bounce_len);
+        assert_eq!(tf.cookie_a1a2(), rpc_cookie);
+        assert_eq!(&tb[..8], b"rpc-load");
+        assert!(h.take_tx().is_none());
+
+        let reply_payload = b"elf-from-tmem-p1";
+        let mut reply = CallFrame { r: [0, 0, 0, 0, 0, 0, 0, 0] };
+        reply.set_cookie_a1a2(rpc_cookie);
+        let reply_pdu = encode_pdu(
+            PduHeader {
+                kind: KIND_RPC_REPLY,
+                seq: 1,
+                arg_len: 64,
+                bounce_len: reply_payload.len() as u32,
+            },
+            reply,
+            reply_payload,
+        );
+        h.push_host_rw(&host_rw(9, &reply_pdu), &reply_pdu).unwrap();
+        let rf = h.recv_rpc_reply().unwrap();
+        assert_eq!(rf.cookie_a1a2(), rpc_cookie);
+        assert_eq!(
+            h.bounce_at(rpc_cookie, reply_payload.len()).unwrap(),
+            reply_payload
+        );
+        assert!(h.take_tx().is_none(), "recv_rpc_reply must not queue KIND_RPC");
+
+        let (out_hdr, out_pdu) = h.complete_stream(got).unwrap();
+        assert_eq!(out_hdr.op, VIRTIO_VSOCK_OP_RW);
+        let decoded = PduHeader::decode(&out_pdu).unwrap();
+        assert_eq!(decoded.kind, KIND_COMPLETE);
+        assert_eq!(decoded.seq, 1);
+        assert_eq!(decoded.bounce_len, enter_bounce.len() as u32);
+        let out_frame = decode_frame(&out_pdu[PDU_HDR_LEN..PDU_HDR_LEN + CALL_FRAME_LEN]).unwrap();
+        assert_eq!(out_frame.cookie_a1a2(), enter_cookie);
+        assert_eq!(
+            &out_pdu[PDU_HDR_LEN + CALL_FRAME_LEN..],
+            enter_bounce.as_slice()
+        );
     }
 }
