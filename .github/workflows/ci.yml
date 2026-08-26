@@ -56,11 +56,16 @@ jobs:
 
       - name: Enable vhost-vsock
         run: |
-          set -x
-          sudo modprobe vhost_vsock || true
-          ls -l /dev/vhost-vsock || true
+          set -euo pipefail
+          sudo modprobe vhost_vsock
+          ls -l /dev/vhost-vsock
           sudo chmod 0666 /dev/vhost-vsock || true
-          ls -l /dev/vhost-vsock || true
+          if ! [ -r /dev/vhost-vsock ] || ! [ -w /dev/vhost-vsock ]; then
+            sudo chown "$(id -u):$(id -g)" /dev/vhost-vsock
+          fi
+          ls -l /dev/vhost-vsock
+          test -r /dev/vhost-vsock
+          test -w /dev/vhost-vsock
 
       - name: Build guest ELF
         run: cargo build -p rustee-guest --features boot --target aarch64-unknown-none
