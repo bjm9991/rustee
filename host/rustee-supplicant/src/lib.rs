@@ -161,8 +161,15 @@ impl Supplicant {
                 let bytes = self.load_ta(&uuid)?;
                 let cookie_us = cookie as usize;
                 let after = (cookie_us + msg_sz + 7) & !7;
-                let tmem = n >= 2 && is_tmem(params[1].attr) && (params[1].a as usize) >= cookie_us;
-                let dest = if tmem && (params[1].b as usize) >= bytes.len() {
+                // Guest #30: cookie 0x80_0000, dest cookie+96, cap 2 MiB. Copy at
+                // params[1].a (pool offset), never onto the MSG at the cookie.
+                let tmem = n >= 2
+                    && is_tmem(params[1].attr)
+                    && (params[1].a as usize) >= after;
+                let dest = if tmem {
+                    if (params[1].b as usize) < bytes.len() {
+                        return Err(SuppError::Io);
+                    }
                     params[1].a as usize
                 } else {
                     after
@@ -344,6 +351,46 @@ mod tests {
         assert_eq!(sz, elf.len());
         assert_eq!(&bounce[dest..dest + sz], elf);
         assert!(window as usize >= dest + sz - cookie as usize);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_ta_copies_at_guest_rpc_cookie() {
+        use rustee_proto::{
+            decode_msg, write_msg, ATTR_TYPE_MASK, ATTR_TYPE_TMEM_OUTPUT, ATTR_TYPE_VALUE_INPUT,
+            MSG_ARG_HDR_SIZE, MSG_PARAM_SIZE, MsgArgHdr, MsgParam,
+        };
+        let dir = env::temp_dir().join("rustee-supp-loadta-cookie");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Supplicant::new(dir.clone()).unwrap();
+        let uuid_hex = "8d825f6a1c4b4c9f9e3a2b7c6d5e4f30";
+        fs::create_dir_all(dir.join("ta")).unwrap();
+        let elf = b"\x7fELF-guest-cookie";
+        fs::write(dir.join("ta").join(format!("{uuid_hex}.ta")), elf).unwrap();
+        let cookie = 0x80_0000u64;
+        let dest = cookie as usize + MSG_ARG_HDR_SIZE + 2 * MSG_PARAM_SIZE;
+        let mut bounce = vec![0u8; dest + elf.len() + 16];
+        let hi = u64::from_str_radix(&uuid_hex[..16], 16).unwrap();
+        let lo = u64::from_str_radix(&uuid_hex[16..], 16).unwrap();
+        let hdr = MsgArgHdr {
+            cmd: RPC_CMD_LOAD_TA,
+            num_params: 2,
+            ..MsgArgHdr::default()
+        };
+        let params = [
+            MsgParam::value(ATTR_TYPE_VALUE_INPUT, hi, lo, 0),
+            MsgParam::tmem(ATTR_TYPE_TMEM_OUTPUT, dest as u64, 2 * 1024 * 1024, 0),
+        ];
+        write_msg(&mut bounce, cookie, hdr, &params).unwrap();
+        let window = s.handle_msg(&mut bounce, cookie).unwrap();
+        let (out, p, _) = decode_msg(&bounce, cookie).unwrap();
+        assert_eq!(out.ret, 0);
+        assert_eq!(p[1].a as usize, dest);
+        assert_eq!(p[1].b as usize, elf.len());
+        assert_eq!(p[1].attr & ATTR_TYPE_MASK, ATTR_TYPE_TMEM_OUTPUT);
+        assert_eq!(&bounce[dest..dest + elf.len()], elf);
+        assert_ne!(&bounce[cookie as usize..cookie as usize + 4], &elf[..4.min(elf.len())]);
+        assert_eq!(window as usize, dest + elf.len() - cookie as usize);
         let _ = fs::remove_dir_all(dir);
     }
 }
