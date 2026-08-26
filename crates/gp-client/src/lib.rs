@@ -72,6 +72,8 @@ impl Uuid {
 pub const HELLO_RS_UUID_BYTES: [u8; 16] = [
     0x8d, 0x82, 0x5f, 0x6a, 0x1c, 0x4b, 0x4c, 0x9f, 0x9e, 0x3a, 0x2b, 0x7c, 0x6d, 0x5e, 0x4f, 0x30,
 ];
+/// Filename hex for `$SUPP_ROOT/ta/{hex}.ta` (Uuid::words 016x twice).
+pub const HELLO_RS_UUID_HEX: &str = "8d825f6a1c4b4c9f9e3a2b7c6d5e4f30";
 
 /// Yielding vsock transport. Fast SMCCC is local and never goes through this.
 pub trait Transport {
@@ -383,6 +385,12 @@ mod tests {
         let n = ctx.invoke_shm(sid, 0, b"hello-rs", &mut dst).unwrap();
         assert_eq!(&dst[..n], b"hello-rs");
         ctx.close_session(sid).unwrap();
+    }
+
+    #[test]
+    fn hello_uuid_hex_matches_words() {
+        let (hi, lo) = Uuid::from_bytes(HELLO_RS_UUID_BYTES).words();
+        assert_eq!(format!("{hi:016x}{lo:016x}"), HELLO_RS_UUID_HEX);
     }
 
     #[test]
