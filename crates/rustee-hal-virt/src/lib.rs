@@ -42,7 +42,8 @@ mod vsock;
 pub use rng::{VirtEntropy, VIRTIO_ID_RNG, VIRTIO_PCI_DEVICE_RNG};
 pub use vsock::{
     encode_pdu, read_pdu, VirtioVsockHdr, VsockConn, VsockListener, VIRTIO_PCI_DEVICE_VSOCK,
-    VIRTIO_PCI_VENDOR, VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
+    VIRTIO_PCI_VENDOR, VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_CREDIT_REQUEST,
+    VIRTIO_VSOCK_OP_CREDIT_UPDATE, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
     VIRTIO_VSOCK_OP_RW, VIRTIO_VSOCK_TYPE_STREAM,
 };
 
@@ -423,6 +424,10 @@ impl VirtHal {
         Ok(conn.wrap_rw(payload).0)
     }
 
+    pub fn credit_update(&self) -> Result<VirtioVsockHdr, HalError> {
+        Ok(self.conn.as_ref().ok_or(HalError::NotFound)?.credit_update())
+    }
+
     pub fn complete_stream(&mut self, out: CallFrame) -> Result<(VirtioVsockHdr, Vec<u8>), HalError> {
         self.call_gate().complete(out)?;
         let (hdr, frame, bounce) = self.take_tx().ok_or(HalError::Fault)?;
@@ -692,6 +697,10 @@ mod tests {
         assert_eq!(resp.src_port, 7007);
         assert_eq!(resp.dst_cid, 2);
         assert_eq!(resp.dst_port, 4242);
+        let cu = h.credit_update().unwrap();
+        assert_eq!(cu.op, VIRTIO_VSOCK_OP_CREDIT_UPDATE);
+        assert_eq!(cu.buf_alloc, 256 * 1024);
+        assert_eq!(cu.dst_port, 4242);
         let mut bad = req;
         bad.dst_port = 9;
         assert!(h.accept_connect(&bad).is_err());
