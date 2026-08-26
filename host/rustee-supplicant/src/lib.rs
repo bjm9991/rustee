@@ -212,6 +212,23 @@ impl Supplicant {
     }
 }
 
+use std::sync::Mutex;
+
+static GLOBAL: Mutex<Option<Supplicant>> = Mutex::new(None);
+
+/// Process-wide hook for `gp-client::wire::StreamTransport::on_rpc`.
+pub fn install(s: Supplicant) {
+    *GLOBAL.lock().expect("supp") = Some(s);
+}
+
+pub fn rpc_hook(bounce: &mut [u8], cookie: u64) -> Result<(), u32> {
+    let mut g = GLOBAL.lock().expect("supp");
+    g.as_mut()
+        .ok_or(0xFFFF_000Eu32)?
+        .handle_msg(bounce, cookie)
+        .map_err(|_| 0xFFFF_000Eu32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

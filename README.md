@@ -27,4 +27,4 @@ v0 virt transport: `vhost-vsock-pci` + bounce buffers (not ivshmem). Guest crate
 
 License: Apache-2.0 OR MIT. A future `rustee-virt.ko` Linux driver would be GPL-2.0-only and is not in the TCB.
 
-See [docs/architecture.md](docs/architecture.md).
+See [docs/architecture.md](docs/architecture.md) and [docs/qemu.md](docs/qemu.md).

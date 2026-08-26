@@ -6,9 +6,10 @@ pub mod wire;
 
 use rustee_proto::{
     answer_fast_smccc, decode_msg, write_msg, CallFrame, MsgArgHdr, MsgParam, PduHeader,
-    ATTR_META, ATTR_TYPE_NONE, ATTR_TYPE_TMEM_INOUT, ATTR_TYPE_TMEM_INPUT, ATTR_TYPE_TMEM_OUTPUT,
-    ATTR_TYPE_VALUE_INOUT, ATTR_TYPE_VALUE_INPUT, ATTR_TYPE_VALUE_OUTPUT, BOUNCE_POOL_SIZE,
-    KIND_ENTER, MSG_ARG_ALIGN, MSG_CMD_CLOSE_SESSION, MSG_CMD_INVOKE_COMMAND, MSG_CMD_OPEN_SESSION,
+    ATTR_META, ATTR_TYPE_MASK, ATTR_TYPE_NONE, ATTR_TYPE_TMEM_INOUT, ATTR_TYPE_TMEM_INPUT,
+    ATTR_TYPE_TMEM_OUTPUT, ATTR_TYPE_VALUE_INOUT, ATTR_TYPE_VALUE_INPUT, ATTR_TYPE_VALUE_OUTPUT,
+    BOUNCE_POOL_SIZE,
+    KIND_ENTER, MSG_ARG_ALIGN, MSG_ARG_HDR_SIZE, MSG_CMD_CLOSE_SESSION, MSG_CMD_INVOKE_COMMAND, MSG_CMD_OPEN_SESSION, MSG_PARAM_SIZE,
     MSG_CMD_REGISTER_SHM, MSG_CMD_UNREGISTER_SHM, PAGE_SIZE, SMC_CALL_WITH_ARG, SMC_CALLS_UID,
     SMC_EXCHANGE_CAPABILITIES, SMC_GET_OS_UUID, SMC_GET_SHM_CONFIG, SMC_GET_THREAD_COUNT,
 };
@@ -56,7 +57,21 @@ impl Uuid {
         }
         (hi, lo)
     }
+
+    pub fn from_bytes(b: [u8; 16]) -> Self {
+        Self {
+            time_low: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            time_mid: u16::from_be_bytes([b[4], b[5]]),
+            time_hi_and_version: u16::from_be_bytes([b[6], b[7]]),
+            clock_seq_and_node: [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
+        }
+    }
 }
+
+/// hello-rs `.rustee.ta_head` uuid (cmd 0 copies memref 0 → 1).
+pub const HELLO_RS_UUID_BYTES: [u8; 16] = [
+    0x8d, 0x82, 0x5f, 0x6a, 0x1c, 0x4b, 0x4c, 0x9f, 0x9e, 0x3a, 0x2b, 0x7c, 0x6d, 0x5e, 0x4f, 0x30,
+];
 
 /// Yielding vsock transport. Fast SMCCC is local and never goes through this.
 pub trait Transport {
@@ -95,6 +110,30 @@ impl Transport for Loopback {
         let n = hdr.num_params as usize;
         let mut pbuf = [MsgParam::default(); 6];
         pbuf[..n].copy_from_slice(&params[..n]);
+        if hdr.cmd == MSG_CMD_INVOKE_COMMAND
+            && n >= 2
+            && (pbuf[0].attr & ATTR_TYPE_MASK) == ATTR_TYPE_TMEM_INPUT
+            && (pbuf[1].attr & ATTR_TYPE_MASK) == ATTR_TYPE_TMEM_OUTPUT
+        {
+            let in_off = pbuf[0].a as usize;
+            let in_sz = pbuf[0].b as usize;
+            let out_off = pbuf[1].a as usize;
+            let out_cap = pbuf[1].b as usize;
+            let copy = in_sz.min(out_cap);
+            if in_off
+                .checked_add(copy)
+                .map(|e| e <= bounce.len())
+                .unwrap_or(false)
+                && out_off
+                    .checked_add(copy)
+                    .map(|e| e <= bounce.len())
+                    .unwrap_or(false)
+            {
+                let tmp = bounce[in_off..in_off + copy].to_vec();
+                bounce[out_off..out_off + copy].copy_from_slice(&tmp);
+                pbuf[1].b = copy as u64;
+            }
+        }
         write_msg(bounce, frame.cookie(), hdr, &pbuf[..n]).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
         Ok(frame)
     }
@@ -178,6 +217,43 @@ impl<T: Transport> Context<T> {
         let frame = CallFrame::yielding_enter(cookie);
         self.transport.enter(frame, &mut self.bounce, n as u32)?;
         Ok(())
+    }
+
+    /// hello-rs cmd 0: TMEM input at param 0, TMEM output at param 1. Returns bytes written.
+    pub fn invoke_shm(&mut self, session: u32, cmd: u32, src: &[u8], dst: &mut [u8]) -> Result<usize, u32> {
+        if src.len() > TEEC_CONFIG_SHAREDMEM_MAX_SIZE as usize
+            || dst.len() > TEEC_CONFIG_SHAREDMEM_MAX_SIZE as usize
+        {
+            return Err(TEEC_ERROR_BAD_PARAMETERS);
+        }
+        let cookie = self.alloc(MSG_ARG_HDR_SIZE + MSG_PARAM_SIZE * 2, MSG_ARG_ALIGN)?;
+        let in_off = self.alloc(src.len().max(1), MSG_ARG_ALIGN)?;
+        let out_off = self.alloc(dst.len().max(1), MSG_ARG_ALIGN)?;
+        self.bounce[in_off as usize..in_off as usize + src.len()].copy_from_slice(src);
+        let hdr = MsgArgHdr {
+            cmd: MSG_CMD_INVOKE_COMMAND,
+            func: cmd,
+            session,
+            num_params: 2,
+            ..MsgArgHdr::default()
+        };
+        let params = [
+            MsgParam::tmem(ATTR_TYPE_TMEM_INPUT, in_off, src.len() as u64, in_off),
+            MsgParam::tmem(ATTR_TYPE_TMEM_OUTPUT, out_off, dst.len() as u64, out_off),
+        ];
+        let n = write_msg(&mut self.bounce, cookie, hdr, &params).map_err(|_| TEEC_ERROR_BAD_PARAMETERS)?;
+        let end = (out_off as usize + dst.len()).max(cookie as usize + n);
+        let blen = (end - cookie as usize) as u32;
+        let frame = CallFrame::yielding_enter(cookie);
+        self.transport.enter(frame, &mut self.bounce, blen)?;
+        let (out, params, _) = decode_msg(&self.bounce, cookie).map_err(|_| TEEC_ERROR_COMMUNICATION)?;
+        if out.ret != TEEC_SUCCESS {
+            return Err(out.ret);
+        }
+        let wrote = params[1].b as usize;
+        let ncpy = wrote.min(dst.len());
+        dst[..ncpy].copy_from_slice(&self.bounce[out_off as usize..out_off as usize + ncpy]);
+        Ok(ncpy)
     }
 
     pub fn close_session(&mut self, session: u32) -> Result<(), u32> {
@@ -278,7 +354,7 @@ mod tests {
     fn open_invoke_close_loopback() {
         let mut ctx = Context::new(Loopback::default());
         ctx.initialize().unwrap();
-        let sid = ctx.open_session(&Uuid::default(), TEEC_LOGIN_PUBLIC).unwrap();
+        let sid = ctx.open_session(&Uuid::from_bytes(HELLO_RS_UUID_BYTES), TEEC_LOGIN_PUBLIC).unwrap();
         ctx.invoke(sid, 1).unwrap();
         ctx.close_session(sid).unwrap();
         assert_eq!(ctx.transport.last_kind, KIND_ENTER);
@@ -294,6 +370,19 @@ mod tests {
         let c = ctx.register_shm(4096).unwrap();
         assert_eq!(c % 4096, 0);
         ctx.unregister_shm(c).unwrap();
+    }
+
+    #[test]
+    fn hello_cmd0_shm_loopback() {
+        let mut ctx = Context::new(Loopback::default());
+        ctx.initialize().unwrap();
+        let sid = ctx
+            .open_session(&Uuid::from_bytes(HELLO_RS_UUID_BYTES), TEEC_LOGIN_PUBLIC)
+            .unwrap();
+        let mut dst = [0u8; 16];
+        let n = ctx.invoke_shm(sid, 0, b"hello-rs", &mut dst).unwrap();
+        assert_eq!(&dst[..n], b"hello-rs");
+        ctx.close_session(sid).unwrap();
     }
 
     #[test]
