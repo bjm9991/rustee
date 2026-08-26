@@ -91,20 +91,25 @@ fn run(h: VirtHal, mut uart: uart::Uart) -> ! {
     let mut k = Kernel::new(h, SoftwareProvider);
     let _ = writeln!(uart, "kernel");
     let _ = k.emit_ree_notices(&mut uart, Some(VirtHal::boot_notices()));
-    let _ = writeln!(uart, "listen {} : {}", VSOCK_GUEST_CID, VSOCK_PORT);
 
     unsafe {
         let vs = pci::find(VIRTIO_PCI_DEVICE_VSOCK)
             .unwrap_or_else(|| crate::uart::fail_halt("no vhost-vsock-pci"));
+        let _ = writeln!(uart, "vsock-pci");
         let v = virtio::VirtioPci::probe(&vs)
             .unwrap_or_else(|| crate::uart::fail_halt("virtio-vsock probe failed"));
+        let _ = writeln!(uart, "vsock-probe");
         v.reset_and_ack();
         let mut rx = v.setup_queue(0);
         let mut tx = v.setup_queue(1);
-        let _ev = v.setup_queue(2);
+        let mut ev = v.setup_queue(2);
         v.driver_ok();
+        let _ = writeln!(uart, "vsock-driver-ok");
         let mut rxbuf = alloc::vec![0u8; 4096];
         rx.add_in(rxbuf.as_mut_ptr(), 4096, 0);
+        let mut evbuf = alloc::vec![0u8; 8];
+        ev.add_in(evbuf.as_mut_ptr(), 8, 0);
+        let _ = writeln!(uart, "listen {} : {}", VSOCK_GUEST_CID, VSOCK_PORT);
         vsock_loop(&mut k, &mut uart, &mut rx, &mut tx, &mut rxbuf);
     }
 }
@@ -138,10 +143,12 @@ unsafe fn vsock_loop(
         let payload = &rxbuf[VIRTIO_VSOCK_HDR_LEN..len as usize];
         match hdr.op {
             VIRTIO_VSOCK_OP_REQUEST => {
-                if let Ok(resp) = k.hal_mut().accept_connect(&hdr) {
-                    let pkt = resp.encode().to_vec();
-                    tx.add_out_owned(pkt);
-                    let _ = writeln!(uart, "vsock accept {}:{}", hdr.src_cid, hdr.src_port);
+                match k.hal_mut().accept_connect(&hdr) {
+                    Ok(resp) => {
+                        tx.add_out_owned(resp.encode().to_vec());
+                        let _ = writeln!(uart, "vsock accept {}:{}", hdr.src_cid, hdr.src_port);
+                    }
+                    Err(_) => crate::uart::fail_halt("vsock REQUEST reject"),
                 }
             }
             VIRTIO_VSOCK_OP_RW => {
