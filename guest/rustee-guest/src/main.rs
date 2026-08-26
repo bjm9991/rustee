@@ -65,12 +65,16 @@ extern "C" fn rust_main() -> ! {
         let rng_dev = pci::find(VIRTIO_PCI_DEVICE_RNG)
             .or_else(|| pci::find(0x1005))
             .unwrap_or_else(|| crate::uart::fail_halt("no virtio-rng-pci"));
+        let _ = writeln!(uart, "rng-pci");
         let v = virtio::VirtioPci::probe(&rng_dev)
             .unwrap_or_else(|| crate::uart::fail_halt("virtio-rng probe failed"));
+        let _ = writeln!(uart, "rng-probe");
         v.reset_and_ack();
+        let _ = writeln!(uart, "rng-features");
         let mut buf = [0u8; 64];
         virtio::rng_fill(&v, &mut buf);
         v.driver_ok();
+        let _ = writeln!(uart, "rng-entropy");
         let mut h = VirtHal::new();
         h.feed_rng(&buf);
         let _ = VIRTIO_ID_RNG;
@@ -83,6 +87,7 @@ fn run(h: VirtHal, mut uart: uart::Uart) -> ! {
         crate::uart::fail_halt("vsock not bound");
     }
     let mut k = Kernel::new(h, SoftwareProvider);
+    let _ = writeln!(uart, "kernel");
     let _ = k.emit_ree_notices(&mut uart, Some(VirtHal::boot_notices()));
     let _ = writeln!(uart, "listen {} : {}", VSOCK_GUEST_CID, VSOCK_PORT);
 
