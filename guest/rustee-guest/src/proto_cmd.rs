@@ -75,7 +75,9 @@ pub fn uuid_to_words(u: Uuid) -> (u64, u64) {
     (hi, lo)
 }
 
-/// Pack `RPC_CMD_LOAD_TA` at [`RPC_COOKIE`]. Returns (cookie, bounce_len) covering MSG + tmem cap.
+/// Pack `RPC_CMD_LOAD_TA` at [`RPC_COOKIE`].
+/// KIND_RPC bounce is MSG only (96 bytes). `params[1].b` is the 2 MiB OUTPUT
+/// cap; Client expands RPC_REPLY bounce_len to dest+ELF. Do not send 2 MiB zeros.
 pub fn pack_load_ta(pool: &mut [u8], uuid: Uuid) -> Result<(u64, u32), ()> {
     let (hi, lo) = uuid_to_words(uuid);
     let dest = RPC_COOKIE + (MSG_ARG_HDR_SIZE + 2 * MSG_PARAM_SIZE) as u64;
@@ -91,12 +93,8 @@ pub fn pack_load_ta(pool: &mut [u8], uuid: Uuid) -> Result<(u64, u32), ()> {
         MsgParam::value(ATTR_TYPE_VALUE_INPUT, hi, lo, 0),
         MsgParam::tmem(ATTR_TYPE_TMEM_OUTPUT, dest, LOAD_TA_CAP, 0),
     ];
-    write_msg(pool, RPC_COOKIE, hdr, &params).map_err(|_| ())?;
-    let bounce_len = dest
-        .checked_add(LOAD_TA_CAP)
-        .and_then(|e| e.checked_sub(RPC_COOKIE))
-        .ok_or(())? as u32;
-    Ok((RPC_COOKIE, bounce_len))
+    let n = write_msg(pool, RPC_COOKIE, hdr, &params).map_err(|_| ())?;
+    Ok((RPC_COOKIE, n as u32))
 }
 
 /// ELF bytes from RPC_REPLY bounce param 1 (`TMEM_OUTPUT`). `params[1].a` is dest, `.b` is size.
