@@ -749,6 +749,34 @@ mod tests {
         assert_eq!(decoded.seq, 1);
     }
 
+    #[test]
+    fn recv_enter_reassembles_host_split_writes() {
+        // StreamTransport::write_pdu is three write()s: 16, 64, bounce.
+        let mut h = VirtHal::new();
+        h.listen_vsock();
+        h.accept_connect(&host_request(9)).unwrap();
+        let cookie: u64 = 0x2000;
+        let mut frame = CallFrame { r: [0x10, 0, 0, 0, 0, 0, 0, 0] };
+        frame.set_cookie_a1a2(cookie);
+        let msg = [0u8; 96];
+        let hdr = PduHeader {
+            kind: KIND_ENTER,
+            seq: 1,
+            arg_len: 64,
+            bounce_len: msg.len() as u32,
+        };
+        let pdu = encode_pdu(hdr, frame, &msg);
+        assert_eq!(pdu.len(), 16 + 64 + 96);
+        h.push_host_rw(&host_rw(9, &pdu[..16]), &pdu[..16]).unwrap();
+        assert_eq!(h.recv_enter().unwrap_err(), HalError::NotFound);
+        h.push_host_rw(&host_rw(9, &pdu[16..80]), &pdu[16..80]).unwrap();
+        assert_eq!(h.recv_enter().unwrap_err(), HalError::NotFound);
+        h.push_host_rw(&host_rw(9, &pdu[80..]), &pdu[80..]).unwrap();
+        let got = h.recv_enter().unwrap();
+        assert_eq!(got.cookie_a1a2(), cookie);
+        assert_eq!(h.bounce_at(cookie, msg.len()).unwrap(), &msg);
+    }
+
     fn host_rw(src_port: u32, pdu: &[u8]) -> VirtioVsockHdr {
         VirtioVsockHdr {
             src_cid: 2,

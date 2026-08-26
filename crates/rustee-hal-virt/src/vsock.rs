@@ -173,6 +173,28 @@ impl VsockConn {
         Ok(())
     }
 
+    /// Peek the PDU header; drain only when hdr+CallFrame+bounce are all present.
+    pub fn take_pdu(&mut self) -> Result<(PduHeader, CallFrame, Vec<u8>), HalError> {
+        if self.rx.len() < PDU_HDR_LEN {
+            return Err(HalError::NotFound);
+        }
+        let hdr = PduHeader::decode(&self.rx[..PDU_HDR_LEN])?;
+        if hdr.arg_len != CALL_FRAME_LEN as u32 {
+            return Err(HalError::InvalidParam);
+        }
+        let total = PDU_HDR_LEN
+            .checked_add(CALL_FRAME_LEN)
+            .and_then(|n| n.checked_add(hdr.bounce_len as usize))
+            .ok_or(HalError::InvalidParam)?;
+        if self.rx.len() < total {
+            return Err(HalError::NotFound);
+        }
+        let bytes: Vec<u8> = self.rx.drain(..total).collect();
+        let frame = decode_frame(&bytes[PDU_HDR_LEN..PDU_HDR_LEN + CALL_FRAME_LEN])?;
+        let bounce = bytes[PDU_HDR_LEN + CALL_FRAME_LEN..].to_vec();
+        Ok((hdr, frame, bounce))
+    }
+
     pub fn wrap_rw<'a>(&self, payload: &'a [u8]) -> (VirtioVsockHdr, &'a [u8]) {
         (
             VirtioVsockHdr {
@@ -210,21 +232,10 @@ impl VsockConn {
 }
 
 /// Read one RUSTEE PDU off an accepted vsock stream.
+/// Host `write_pdu` is three `write`s (16 + 64 + bounce). Do not drain until
+/// the whole PDU is buffered, or a later chunk is decoded as a new header.
 pub fn read_pdu(conn: &mut VsockConn) -> Result<(PduHeader, CallFrame, Vec<u8>), HalError> {
-    let mut hb = [0u8; PDU_HDR_LEN];
-    conn.recv_exact(&mut hb)?;
-    let hdr = PduHeader::decode(&hb)?;
-    if hdr.arg_len != CALL_FRAME_LEN as u32 {
-        return Err(HalError::InvalidParam);
-    }
-    let mut fb = [0u8; CALL_FRAME_LEN];
-    conn.recv_exact(&mut fb)?;
-    let frame = decode_frame(&fb)?;
-    let mut bounce = alloc::vec![0u8; hdr.bounce_len as usize];
-    if !bounce.is_empty() {
-        conn.recv_exact(&mut bounce)?;
-    }
-    Ok((hdr, frame, bounce))
+    conn.take_pdu()
 }
 
 pub fn encode_pdu(hdr: PduHeader, frame: CallFrame, bounce: &[u8]) -> Vec<u8> {
