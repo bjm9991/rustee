@@ -34,3 +34,43 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+  qemu-smoke:
+    name: QEMU hello-ca (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and guest target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-none
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm
+
+      - name: Build guest ELF
+        working-directory: guest/rustee-guest
+        run: cargo build --features boot --target aarch64-unknown-none
+
+      - name: Build hello-ca
+        run: cargo build -p rustee-smoke --bin hello-ca
+
+      - name: Run QEMU hello-ca smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rustee-supp
+          timeout 60s host/run-qemu.sh \
+            target/aarch64-unknown-none/debug/rustee-guest &
+          qemu_pid=$!
+          trap 'kill "$qemu_pid" 2>/dev/null || true' EXIT
+          sleep 3
+          if ! kill -0 "$qemu_pid" 2>/dev/null; then
+            wait "$qemu_pid"
+          fi
+          timeout 30s env RUSTEE_SUPP_ROOT=/tmp/rustee-supp \
+            target/debug/hello-ca
