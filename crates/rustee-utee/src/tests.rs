@@ -505,3 +505,46 @@ fn persistent_object_enumerator() {
         TEE_FreePersistentObjectEnumerator(core::ptr::null_mut());
     });
 }
+
+#[test]
+fn ree_fs_persistent_store_list() {
+    reset();
+    struct Ctr(u8);
+    impl rustee_hal::Entropy for Ctr {
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf {
+                *b = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+        }
+        fn origin(&self) -> rustee_hal::EntropyOrigin {
+            rustee_hal::EntropyOrigin::Isolated
+        }
+    }
+    struct TestHuk;
+    impl rustee_hal::Huk for TestHuk {
+        fn material(&self) -> &[u8] {
+            b"0123456789abcdef0123456789abcdef"
+        }
+    }
+    let mut ree = rustee_storage::ReeFs::new(Ctr(1), TestHuk, rustee_storage::MemFs::new());
+    // enumerator lists the current TA uuid (reset default is zeros)
+    ree.create([0u8; 16], b"oid-1", 0, b"hello").unwrap();
+    with_persistent_store(&mut ree, || {
+        let mut e: TeeObjectEnumHandle = core::ptr::null_mut();
+        assert_eq!(TEE_AllocatePersistentObjectEnumerator(&mut e), TEE_SUCCESS);
+        assert_eq!(
+            TEE_StartPersistentObjectEnumerator(e, TEE_STORAGE_PRIVATE),
+            TEE_SUCCESS
+        );
+        let mut info = crate::param::TeeObjectInfo::default();
+        let mut id = [0u8; 16];
+        let mut id_len = id.len();
+        assert_eq!(
+            TEE_GetNextPersistentObject(e, &mut info, id.as_mut_ptr() as *mut c_void, &mut id_len),
+            TEE_SUCCESS
+        );
+        assert_eq!(&id[..id_len], b"oid-1");
+        TEE_FreePersistentObjectEnumerator(e);
+    });
+}

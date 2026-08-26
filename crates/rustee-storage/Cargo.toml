@@ -10,3 +10,4 @@ description = "Encrypted ree-fs. Not GP trusted storage. Not anti-rollback."
 [dependencies]
 rustee-hal = { workspace = true }
 rustee-crypto = { workspace = true }
+rustee-proto = { workspace = true }
