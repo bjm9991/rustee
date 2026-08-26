@@ -21,6 +21,7 @@ pub const VIRTIO_VSOCK_OP_RST: u16 = 3;
 pub const VIRTIO_VSOCK_OP_SHUTDOWN: u16 = 4;
 pub const VIRTIO_VSOCK_OP_RW: u16 = 5;
 pub const VIRTIO_VSOCK_OP_CREDIT_UPDATE: u16 = 6;
+pub const VIRTIO_VSOCK_OP_CREDIT_REQUEST: u16 = 7;
 
 pub const VIRTIO_VSOCK_HDR_LEN: usize = 44;
 pub const VSOCK_BUF_ALLOC: u32 = 256 * 1024;
@@ -188,6 +189,23 @@ impl VsockConn {
             },
             payload,
         )
+    }
+
+    /// Host send() credit. Linux updates this from RESPONSE; vhost still
+    /// blocks a stream write if peer_buf_alloc stays 0, so send after accept.
+    pub fn credit_update(&self) -> VirtioVsockHdr {
+        VirtioVsockHdr {
+            src_cid: self.guest_cid,
+            dst_cid: self.host_cid,
+            src_port: self.guest_port,
+            dst_port: self.host_port,
+            len: 0,
+            ty: VIRTIO_VSOCK_TYPE_STREAM,
+            op: VIRTIO_VSOCK_OP_CREDIT_UPDATE,
+            flags: 0,
+            buf_alloc: VSOCK_BUF_ALLOC,
+            fwd_cnt: self.fwd_cnt,
+        }
     }
 }
 

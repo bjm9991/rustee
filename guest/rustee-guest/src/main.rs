@@ -16,7 +16,8 @@ use rustee_crypto::SoftwareProvider;
 use rustee_hal::{CallFrame, CallGate, Hal, HalError, Perms};
 use rustee_hal_virt::{
     VirtHal, VirtioVsockHdr, VIRTIO_ID_RNG, VIRTIO_PCI_DEVICE_RNG, VIRTIO_PCI_DEVICE_VSOCK,
-    VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RW, VSOCK_GUEST_CID, VSOCK_PORT,
+    VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_CREDIT_REQUEST, VIRTIO_VSOCK_OP_CREDIT_UPDATE,
+    VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RW, VSOCK_GUEST_CID, VSOCK_PORT,
 };
 use rustee_os::{HalRpc, Kernel, KernelCmd, KernelOut, MemrefSrc, Param, RpcResponse, Uuid};
 
@@ -147,11 +148,15 @@ unsafe fn vsock_loop(
                     Ok(resp) => {
                         tx.add_out_owned(resp.encode().to_vec());
                         let _ = writeln!(uart, "vsock accept {}:{}", hdr.src_cid, hdr.src_port);
+                        if let Ok(cu) = k.hal_mut().credit_update() {
+                            tx.add_out_owned(cu.encode().to_vec());
+                        }
                     }
                     Err(_) => crate::uart::fail_halt("vsock REQUEST reject"),
                 }
             }
             VIRTIO_VSOCK_OP_RW => {
+                let _ = writeln!(uart, "vsock-rw {}", hdr.len);
                 if k.hal_mut().push_host_rw(&hdr, payload).is_ok() {
                     if waiting.is_some() {
                         match k.hal_mut().recv_rpc_reply() {
@@ -162,12 +167,34 @@ unsafe fn vsock_loop(
                             Err(HalError::NotFound) => {}
                             Err(_) => crate::uart::fail_halt("rpc reply"),
                         }
-                    } else if let Ok(frame) = k.hal_mut().recv_enter() {
-                        handle_enter(k, uart, tx, frame, &mut waiting);
+                    } else {
+                        match k.hal_mut().recv_enter() {
+                            Ok(frame) => {
+                                let _ = writeln!(uart, "vsock-enter");
+                                handle_enter(k, uart, tx, frame, &mut waiting);
+                            }
+                            Err(HalError::NotFound) => {}
+                            Err(_) => {
+                                let _ = writeln!(uart, "vsock-enter-drop");
+                            }
+                        }
                     }
+                    if let Ok(cu) = k.hal_mut().credit_update() {
+                        tx.add_out_owned(cu.encode().to_vec());
+                    }
+                } else {
+                    let _ = writeln!(uart, "vsock-rw-drop");
                 }
             }
-            _ => {}
+            VIRTIO_VSOCK_OP_CREDIT_REQUEST => {
+                if let Ok(cu) = k.hal_mut().credit_update() {
+                    tx.add_out_owned(cu.encode().to_vec());
+                }
+            }
+            VIRTIO_VSOCK_OP_CREDIT_UPDATE => {}
+            op => {
+                let _ = writeln!(uart, "vsock-op {}", op);
+            }
         }
         rx.add_in(rxbuf.as_mut_ptr(), 4096, 0);
     }
@@ -183,11 +210,23 @@ fn handle_enter(
     let cookie = frame.cookie_a1a2();
     let cmd = {
         let Some(pool) = k.hal_mut().bounce_at(0, rustee_hal_virt::BOUNCE_POOL_SIZE) else {
-            return;
+            crate::uart::fail_halt("bounce");
         };
         match proto_cmd::decode_cmd(pool, cookie) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => {
+                let _ = writeln!(uart, "vsock-cmd-bad");
+                if let Some(buf) = k
+                    .hal_mut()
+                    .bounce_at_mut(0, rustee_hal_virt::BOUNCE_POOL_SIZE)
+                {
+                    proto_cmd::write_done(buf, cookie, 0xFFFF_0006, 4, 0);
+                }
+                if let Ok((vh, pdu)) = k.hal_mut().complete_stream(frame) {
+                    send_rw(tx, vh, &pdu);
+                }
+                return;
+            }
         }
     };
     import_memrefs(k, &cmd);
@@ -242,10 +281,13 @@ fn dispatch_out(
             }
             if let Ok((vh, pdu)) = k.hal_mut().complete_stream(frame) {
                 send_rw(tx, vh, &pdu);
+                let _ = writeln!(uart, "vsock-complete");
+            } else {
+                let _ = writeln!(uart, "vsock-complete-drop");
             }
-            let _ = uart;
         }
         KernelOut::Rpc(HalRpc::LoadTa { uuid }) => {
+            let _ = writeln!(uart, "vsock-rpc");
             send_load_ta(k, tx, uuid);
             *waiting = Some(frame);
         }
