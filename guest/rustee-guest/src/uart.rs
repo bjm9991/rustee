@@ -36,3 +36,12 @@ pub fn fail_halt(msg: &str) -> ! {
         unsafe { core::arch::asm!("wfe") }
     }
 }
+
+/// EL1 sync abort (TA jump to unmapped VA, alignment, etc.).
+pub fn fail_halt_fmt(esr: u64, elr: u64, far: u64) -> ! {
+    let mut u = Uart;
+    let _ = writeln!(u, "sync-el1 esr={esr:#x} elr={elr:#x} far={far:#x}");
+    loop {
+        unsafe { core::arch::asm!("wfe") }
+    }
+}

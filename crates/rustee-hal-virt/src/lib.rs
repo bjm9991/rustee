@@ -213,16 +213,51 @@ pub struct VirtAs {
     mapped: usize,
     /// Guest VA of bounce pool base. cookie is an offset; map_shm returns base+cookie.
     pool_va: u64,
+    /// Retained PT_LOAD copies. Pointers returned by map_image stay valid until drop_all.
+    images: Vec<Vec<u8>>,
+}
+
+/// Write-back to the PoU then invalidate I-cache so EL1 can execute a just-copied TA.
+#[cfg(target_arch = "aarch64")]
+fn sync_icache(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        let start = ptr as usize;
+        let end = start.saturating_add(len);
+        let mut p = start & !63;
+        while p < end {
+            core::arch::asm!("dc cvau, {x}", x = in(reg) p, options(nostack));
+            p = p.saturating_add(64);
+        }
+        core::arch::asm!("dsb ish", options(nostack));
+        p = start & !63;
+        while p < end {
+            core::arch::asm!("ic ivau, {x}", x = in(reg) p, options(nostack));
+            p = p.saturating_add(64);
+        }
+        core::arch::asm!("dsb ish; isb", options(nostack));
+    }
 }
 
 impl AddressSpace for VirtAs {
-    fn map_image(&mut self, _va: VirtAddr, src: &[u8], perms: Perms) -> Result<(), HalError> {
+    fn map_image(&mut self, va: VirtAddr, src: &[u8], perms: Perms) -> Result<VirtAddr, HalError> {
         if perms.exec && src.is_empty() {
             return Err(HalError::InvalidParam);
         }
-        let _ = PAGE_SIZE;
+        let _ = (PAGE_SIZE, va);
+        let mut buf = Vec::new();
+        buf.resize(src.len(), 0);
+        buf.copy_from_slice(src);
+        self.images.push(buf);
+        let ptr = self.images.last().unwrap().as_ptr();
+        #[cfg(target_arch = "aarch64")]
+        if perms.exec {
+            sync_icache(ptr, src.len());
+        }
         self.mapped = self.mapped.saturating_add(1);
-        Ok(())
+        Ok(VirtAddr(ptr as u64))
     }
 
     fn map_shm(&mut self, shm: &impl SharedMem, perms: Perms) -> Result<VirtAddr, HalError> {
@@ -247,6 +282,7 @@ impl AddressSpace for VirtAs {
 
     fn drop_all(&mut self) {
         self.mapped = 0;
+        self.images.clear();
     }
 }
 
@@ -502,7 +538,7 @@ impl Hal for VirtHal {
         })
     }
     fn new_address_space(&mut self) -> Self::AddressSpace {
-        VirtAs { mapped: 0, pool_va: self.pool_va }
+        VirtAs { mapped: 0, pool_va: self.pool_va, images: Vec::new() }
     }
     fn lookup_shm(&self, cookie: u64) -> Option<&Self::SharedMem> {
         self.shms.iter().filter_map(|s| s.as_ref()).find(|s| s.cookie() == cookie)
@@ -545,6 +581,20 @@ mod tests {
             core::ptr::write(va.0 as *mut u8, 0x42);
         }
         assert_eq!(h.bounce_at(0x1000, 1).unwrap()[0], 0x42);
+    }
+
+    #[test]
+    fn map_image_retains_bytes_at_returned_va() {
+        let mut h = VirtHal::new();
+        let mut aspace = h.new_address_space();
+        let src = b"\x00\x01\x02\x03TA";
+        let va = aspace.map_image(VirtAddr(0x10000), src, Perms::RX).unwrap();
+        assert_ne!(va.0, 0x10000, "virt load VA is the retained copy, not the ELF VA");
+        unsafe {
+            let got = core::slice::from_raw_parts(va.0 as *const u8, src.len());
+            assert_eq!(got, src);
+        }
+        aspace.drop_all();
     }
 
     #[test]

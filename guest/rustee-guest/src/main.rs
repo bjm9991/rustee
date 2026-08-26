@@ -161,6 +161,7 @@ unsafe fn vsock_loop(
                     if waiting.is_some() {
                         match k.hal_mut().recv_rpc_reply() {
                             Ok(_) => {
+                                let _ = writeln!(uart, "vsock-rpc-complete");
                                 let enter = waiting.take().unwrap();
                                 handle_rpc_reply(k, uart, tx, enter, &mut waiting);
                             }
@@ -246,8 +247,14 @@ fn handle_rpc_reply(
             crate::uart::fail_halt("bounce");
         };
         match proto_cmd::take_load_ta(pool) {
-            Ok(bytes) => RpcResponse::LoadTa { bytes },
-            Err(code) => RpcResponse::Error { code },
+            Ok(bytes) => {
+                let _ = writeln!(uart, "vsock-rpc-reply {}", bytes.len());
+                RpcResponse::LoadTa { bytes }
+            }
+            Err(code) => {
+                let _ = writeln!(uart, "vsock-rpc-reply-err {code:#x}");
+                RpcResponse::Error { code }
+            }
         }
     };
     let out = k.handle(KernelCmd::RpcComplete { resp });

@@ -27,7 +27,7 @@ impl SharedMem for TzShm {
 
 pub struct TzAs;
 impl AddressSpace for TzAs {
-    fn map_image(&mut self, _: VirtAddr, _: &[u8], _: Perms) -> Result<(), HalError> {
+    fn map_image(&mut self, _: VirtAddr, _: &[u8], _: Perms) -> Result<VirtAddr, HalError> {
         Err(HalError::Unsupported)
     }
     fn map_shm(&mut self, _: &impl SharedMem, _: Perms) -> Result<VirtAddr, HalError> {
