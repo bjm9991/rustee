@@ -1,2 +1,5 @@
+# -Tlink.ld lives only in build.rs (absolute path). Passing it here too
+# double-feeds lld when CI `cd guest/rustee-guest && cargo build`, which
+# is rust-lld "section .text file range overlaps with .debug_loc".
 [target.aarch64-unknown-none]
-rustflags = ["-C", "link-arg=-Tlink.ld", "-C", "panic=abort"]
+rustflags = ["-C", "panic=abort"]
