@@ -321,6 +321,12 @@ impl VirtHal {
         self.bounce_mem.get(start..end)
     }
 
+    pub fn bounce_at_mut(&mut self, cookie: u64, len: usize) -> Option<&mut [u8]> {
+        let start = cookie as usize;
+        let end = start.checked_add(len)?;
+        self.bounce_mem.get_mut(start..end)
+    }
+
     pub fn import_shm(&mut self, offset: u64, len: usize, perms: Perms) -> Result<(), HalError> {
         if perms.exec {
             return Err(HalError::PermDenied);
@@ -328,8 +334,11 @@ impl VirtHal {
         if (offset as usize) + len > self.bounce.len {
             return Err(HalError::InvalidParam);
         }
-        if offset % (PAGE_SIZE as u64) != 0 || len % PAGE_SIZE != 0 {
+        if offset % (MSG_ARG_ALIGN as u64) != 0 {
             return Err(HalError::BadAlignment);
+        }
+        if self.shms.iter().flatten().any(|s| s.cookie() == offset) {
+            return Ok(());
         }
         let slot = self.shms.iter_mut().find(|s| s.is_none()).ok_or(HalError::NoMemory)?;
         *slot = Some(VirtShm { cookie: offset, len, perms });
@@ -376,6 +385,11 @@ impl VirtHal {
     }
 
     /// CallGate complete, then wrap COMPLETE PDU as a guest RW packet.
+    pub fn wrap_outgoing(&self, payload: &[u8]) -> Result<VirtioVsockHdr, HalError> {
+        let conn = self.conn.as_ref().ok_or(HalError::NotFound)?;
+        Ok(conn.wrap_rw(payload).0)
+    }
+
     pub fn complete_stream(&mut self, out: CallFrame) -> Result<(VirtioVsockHdr, Vec<u8>), HalError> {
         self.call_gate().complete(out)?;
         let (hdr, frame, bounce) = self.take_tx().ok_or(HalError::Fault)?;

@@ -6,21 +6,18 @@ Host Linux needs `vhost_vsock`. Guest CID **3**, port **7007**, `SOCK_STREAM`.
 `rustee-virt.ko` / `hello-ca` `kernel_connect`s; virtio REQUEST/RESPONSE is vhost.
 Entropy is `virtio-rng` (REE-sourced). No ivshmem.
 
+Build the guest ELF (HAL `init` binds CID 3:7007 + virtio-rng):
+
+```
+cargo build -p rustee-guest --target aarch64-unknown-none --features boot
+```
+
 ```
 sudo modprobe vhost_vsock
-
-qemu-system-aarch64 \
-  -machine virt \
-  -cpu max \
-  -m 256M \
-  -smp 1 \
-  -nographic \
-  -device vhost-vsock-pci,guest-cid=3 \
-  -device virtio-rng-pci \
-  -kernel "$RUSTEE_GUEST_ELF"
+host/run-qemu.sh target/aarch64-unknown-none/debug/rustee-guest
 ```
 
-`$RUSTEE_GUEST_ELF` is the HAL/kernel image (binds CID 3:7007 at `Hal::init`). Then:
+Then:
 
 ```
 RUSTEE_SUPP_ROOT=/tmp/rustee-supp cargo run -p rustee-smoke --bin hello-ca
