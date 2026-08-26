@@ -13,12 +13,12 @@ mod virtio;
 use core::arch::asm;
 use core::fmt::Write;
 use rustee_crypto::SoftwareProvider;
-use rustee_hal::{CallGate, Hal, Perms};
+use rustee_hal::{CallFrame, CallGate, Hal, HalError, Perms};
 use rustee_hal_virt::{
     VirtHal, VirtioVsockHdr, VIRTIO_ID_RNG, VIRTIO_PCI_DEVICE_RNG, VIRTIO_PCI_DEVICE_VSOCK,
     VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RW, VSOCK_GUEST_CID, VSOCK_PORT,
 };
-use rustee_os::{Kernel, KernelOut, MemrefSrc, Param};
+use rustee_os::{HalRpc, Kernel, KernelCmd, KernelOut, MemrefSrc, Param, RpcResponse, Uuid};
 
 core::arch::global_asm!(
     r#"
@@ -109,6 +109,7 @@ unsafe fn vsock_loop(
     tx: &mut virtio::Virtq,
     rxbuf: &mut [u8],
 ) -> ! {
+    let mut waiting: Option<CallFrame> = None;
     loop {
         tx.recycle_used();
         let Some((id, len)) = rx.poll_used() else {
@@ -138,8 +139,17 @@ unsafe fn vsock_loop(
             }
             VIRTIO_VSOCK_OP_RW => {
                 if k.hal_mut().push_host_rw(&hdr, payload).is_ok() {
-                    if let Ok(frame) = k.hal_mut().recv_enter() {
-                        handle_enter(k, uart, tx, frame);
+                    if waiting.is_some() {
+                        match k.hal_mut().recv_rpc_reply() {
+                            Ok(_) => {
+                                let enter = waiting.take().unwrap();
+                                handle_rpc_reply(k, uart, tx, enter, &mut waiting);
+                            }
+                            Err(HalError::NotFound) => {}
+                            Err(_) => crate::uart::fail_halt("rpc reply"),
+                        }
+                    } else if let Ok(frame) = k.hal_mut().recv_enter() {
+                        handle_enter(k, uart, tx, frame, &mut waiting);
                     }
                 }
             }
@@ -153,7 +163,8 @@ fn handle_enter(
     k: &mut Kernel<VirtHal>,
     uart: &mut uart::Uart,
     tx: &mut virtio::Virtq,
-    frame: rustee_hal::CallFrame,
+    frame: CallFrame,
+    waiting: &mut Option<CallFrame>,
 ) {
     let cookie = frame.cookie_a1a2();
     let cmd = {
@@ -166,10 +177,43 @@ fn handle_enter(
         }
     };
     import_memrefs(k, &cmd);
-    match k.handle(cmd) {
+    let out = k.handle(cmd);
+    dispatch_out(k, uart, tx, frame, out, waiting);
+}
+
+fn handle_rpc_reply(
+    k: &mut Kernel<VirtHal>,
+    uart: &mut uart::Uart,
+    tx: &mut virtio::Virtq,
+    enter: CallFrame,
+    waiting: &mut Option<CallFrame>,
+) {
+    let resp = {
+        let Some(pool) = k.hal_mut().bounce_at(0, rustee_hal_virt::BOUNCE_POOL_SIZE) else {
+            crate::uart::fail_halt("bounce");
+        };
+        match proto_cmd::take_load_ta(pool) {
+            Ok(bytes) => RpcResponse::LoadTa { bytes },
+            Err(code) => RpcResponse::Error { code },
+        }
+    };
+    let out = k.handle(KernelCmd::RpcComplete { resp });
+    dispatch_out(k, uart, tx, enter, out, waiting);
+}
+
+fn dispatch_out(
+    k: &mut Kernel<VirtHal>,
+    uart: &mut uart::Uart,
+    tx: &mut virtio::Virtq,
+    frame: CallFrame,
+    out: KernelOut,
+    waiting: &mut Option<CallFrame>,
+) {
+    match out {
         KernelOut::Done {
             result, session, ..
         } => {
+            let cookie = frame.cookie_a1a2();
             if let Some(buf) = k
                 .hal_mut()
                 .bounce_at_mut(0, rustee_hal_virt::BOUNCE_POOL_SIZE)
@@ -187,15 +231,35 @@ fn handle_enter(
             }
             let _ = uart;
         }
-        KernelOut::Rpc(_) => {
-            let _ = k.hal_mut().call_gate().rpc_yield(frame);
-            if let Some((hdr, fr, bounce)) = k.hal_mut().take_tx() {
-                let pdu = rustee_hal_virt::encode_pdu(hdr, fr, &bounce);
-                if let Ok(vh) = k.hal_mut().wrap_outgoing(&pdu) {
-                    send_rw(tx, vh, &pdu);
-                }
-            }
+        KernelOut::Rpc(HalRpc::LoadTa { uuid }) => {
+            send_load_ta(k, tx, uuid);
+            *waiting = Some(frame);
         }
+        KernelOut::Rpc(_) => crate::uart::fail_halt("rpc not LoadTa"),
+    }
+}
+
+fn send_load_ta(k: &mut Kernel<VirtHal>, tx: &mut virtio::Virtq, uuid: Uuid) {
+    let (cookie, bounce_len) = {
+        let Some(buf) = k
+            .hal_mut()
+            .bounce_at_mut(0, rustee_hal_virt::BOUNCE_POOL_SIZE)
+        else {
+            crate::uart::fail_halt("bounce");
+        };
+        proto_cmd::pack_load_ta(buf, uuid)
+            .unwrap_or_else(|_| crate::uart::fail_halt("pack LOAD_TA"))
+    };
+    k.hal_mut().set_rpc_window(cookie, bounce_len);
+    let mut rpc_frame = CallFrame { r: [0; 8] };
+    rpc_frame.set_cookie_a1a2(cookie);
+    let _ = k.hal_mut().call_gate().rpc_yield(rpc_frame);
+    let Some((hdr, fr, bounce)) = k.hal_mut().take_tx() else {
+        crate::uart::fail_halt("rpc tx");
+    };
+    let pdu = rustee_hal_virt::encode_pdu(hdr, fr, &bounce);
+    if let Ok(vh) = k.hal_mut().wrap_outgoing(&pdu) {
+        send_rw(tx, vh, &pdu);
     }
 }
 
