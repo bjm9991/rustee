@@ -19,7 +19,7 @@ use rustee_hal_virt::{
     VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_CREDIT_REQUEST, VIRTIO_VSOCK_OP_CREDIT_UPDATE,
     VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RW, VSOCK_GUEST_CID, VSOCK_PORT,
 };
-use rustee_os::{HalRpc, Kernel, KernelCmd, KernelOut, MemrefSrc, Param, RpcResponse, Uuid};
+use rustee_os::{HalRpc, Kernel, KernelCmd, KernelOut, MemrefSrc, Param, RpcResponse, Uuid, PARAM_COUNT};
 
 core::arch::global_asm!(
     r#"
@@ -221,7 +221,7 @@ fn handle_enter(
                     .hal_mut()
                     .bounce_at_mut(0, rustee_hal_virt::BOUNCE_POOL_SIZE)
                 {
-                    proto_cmd::write_done(buf, cookie, 0xFFFF_0006, 4, 0);
+                    proto_cmd::write_done(buf, cookie, 0xFFFF_0006, 4, 0, &[Param::None; PARAM_COUNT]);
                 }
                 if let Ok((vh, pdu)) = k.hal_mut().complete_stream(frame) {
                     send_rw(tx, vh, &pdu);
@@ -271,7 +271,9 @@ fn dispatch_out(
 ) {
     match out {
         KernelOut::Done {
-            result, session, ..
+            result,
+            session,
+            params,
         } => {
             let cookie = frame.cookie_a1a2();
             if let Some(buf) = k
@@ -284,11 +286,12 @@ fn dispatch_out(
                     result.code,
                     result.origin.as_gp(),
                     session.map(|s| s.0).unwrap_or(0),
+                    &params,
                 );
             }
             if let Ok((vh, pdu)) = k.hal_mut().complete_stream(frame) {
                 send_rw(tx, vh, &pdu);
-                let _ = writeln!(uart, "vsock-complete");
+                let _ = writeln!(uart, "vsock-complete {:#x}", result.code);
             } else {
                 let _ = writeln!(uart, "vsock-complete-drop");
             }

@@ -175,11 +175,32 @@ pub fn decode_cmd(pool: &[u8], cookie: u64) -> Result<KernelCmd, ()> {
     }
 }
 
-pub fn write_done(pool: &mut [u8], cookie: u64, ret: u32, origin: u32, session: u32) {
-    if let Ok((mut hdr, params, _)) = decode_msg(pool, cookie) {
+pub fn write_done(
+    pool: &mut [u8],
+    cookie: u64,
+    ret: u32,
+    origin: u32,
+    session: u32,
+    produced: &[Param; PARAM_COUNT],
+) {
+    if let Ok((mut hdr, mut params, _)) = decode_msg(pool, cookie) {
         hdr.ret = ret;
         hdr.ret_origin = origin;
         hdr.session = session;
+        let mut ui = 0usize;
+        for i in 0..hdr.num_params as usize {
+            if params[i].attr & ATTR_META != 0 {
+                continue;
+            }
+            if ui < PARAM_COUNT {
+                if let Param::Memref { size, dir, .. } = produced[ui] {
+                    if dir != Dir::In {
+                        params[i].b = size as u64;
+                    }
+                }
+                ui += 1;
+            }
+        }
         let n = hdr.num_params as usize;
         let _ = rustee_proto::write_msg(pool, cookie, hdr, &params[..n]);
     }

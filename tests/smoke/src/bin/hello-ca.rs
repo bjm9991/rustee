@@ -54,7 +54,8 @@ fn run(root: PathBuf) -> Result<usize, u32> {
     eprintln!("hello-ca: session {sid}");
     let mut dst = [0u8; 16];
     let n = ctx.invoke_shm(sid, 0, b"hello-rs", &mut dst)?;
-    if &dst[..n] != b"hello-rs" {
+    if n != 8 || &dst[..n] != b"hello-rs" {
+        eprintln!("hello-ca: shm got {n} {dst:?}");
         return Err(0xFFFF_000Fu32);
     }
     ctx.close_session(sid)?;
