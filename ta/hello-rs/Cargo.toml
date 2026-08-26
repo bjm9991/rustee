@@ -5,9 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 rustee-utee = { workspace = true }
 
 [lib]
-crate-type = ["lib"]
+crate-type = ["lib", "staticlib"]
