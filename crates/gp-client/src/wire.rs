@@ -17,7 +17,9 @@ pub struct StreamTransport<S> {
     seq: u32,
     yielding: bool,
     /// Optional RPC: mutate bounce at the MSG cookie, then we send RPC_REPLY.
-    pub on_rpc: Option<fn(&mut [u8], u64) -> Result<(), u32>>,
+    /// `Ok(n)` with n>0 is the RPC_REPLY bounce_len (covers ELF after LOAD_TA).
+    /// `Ok(0)` keeps the RPC PDU bounce_len.
+    pub on_rpc: Option<fn(&mut [u8], u64) -> Result<u32, u32>>,
 }
 
 impl<S> StreamTransport<S> {
@@ -99,8 +101,12 @@ impl<S: Read + Write> crate::Transport for StreamTransport<S> {
                     return Ok(out);
                 }
                 KIND_RPC => {
+                    let mut reply_len = hdr.bounce_len;
                     if let Some(h) = self.on_rpc {
-                        h(bounce, out.cookie())?;
+                        let n = h(bounce, out.cookie())?;
+                        if n > 0 {
+                            reply_len = n;
+                        }
                     }
                     write_pdu(
                         &mut self.sock,
@@ -108,7 +114,7 @@ impl<S: Read + Write> crate::Transport for StreamTransport<S> {
                         hdr.seq,
                         rustee_proto::CallFrame::return_from_rpc(out.cookie()),
                         bounce,
-                        hdr.bounce_len,
+                        reply_len,
                     )?;
                 }
                 KIND_ENTER | KIND_RPC_REPLY => {
@@ -194,9 +200,9 @@ mod tests {
         assert_eq!(out.cookie(), 8);
     }
 
-    fn mark_rpc(b: &mut [u8], c: u64) -> Result<(), u32> {
+    fn mark_rpc(b: &mut [u8], c: u64) -> Result<u32, u32> {
         b[c as usize + 1] = 0xCD;
-        Ok(())
+        Ok(0)
     }
 
     #[test]

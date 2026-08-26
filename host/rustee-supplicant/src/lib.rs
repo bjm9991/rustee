@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustee_proto::{
+    ATTR_TYPE_MASK, ATTR_TYPE_TMEM_INOUT, ATTR_TYPE_TMEM_INPUT, ATTR_TYPE_TMEM_OUTPUT, MsgParam,
     RPC_CMD_FS, RPC_CMD_GET_TIME, RPC_CMD_LOAD_TA, RPC_FS_CLOSE, RPC_FS_CLOSEDIR, RPC_FS_CREATE,
     RPC_FS_OPEN, RPC_FS_OPENDIR, RPC_FS_READ, RPC_FS_READDIR, RPC_FS_REMOVE, RPC_FS_RENAME,
     RPC_FS_TRUNCATE, RPC_FS_WRITE,
@@ -137,9 +138,12 @@ impl Supplicant {
 
 
     /// Decode RPC MSG at cookie and fill outputs in bounce. GET_TIME / LOAD_TA / FS.
-    pub fn handle_msg(&mut self, bounce: &mut [u8], cookie: u64) -> Result<(), SuppError> {
-        let (hdr, mut params, _) = rustee_proto::decode_msg(bounce, cookie).map_err(|_| SuppError::BadCmd)?;
+    /// Returns the bounce window length from `cookie` (0-length RPC keeps MSG size).
+    pub fn handle_msg(&mut self, bounce: &mut [u8], cookie: u64) -> Result<u32, SuppError> {
+        let (mut hdr, mut params, msg_sz) =
+            rustee_proto::decode_msg(bounce, cookie).map_err(|_| SuppError::BadCmd)?;
         let n = hdr.num_params as usize;
+        let window = msg_sz as u32;
         match hdr.cmd {
             RPC_CMD_GET_TIME => {
                 if n < 1 {
@@ -154,14 +158,32 @@ impl Supplicant {
                     return Err(SuppError::BadCmd);
                 }
                 let uuid = format!("{:016x}{:016x}", params[0].a, params[0].b);
-                match self.load_ta(&uuid) {
-                    Ok(bytes) => {
-                        if n >= 2 {
-                            params[1].b = bytes.len() as u64;
-                        }
-                    }
-                    Err(_) => return Err(SuppError::NotFound),
+                let bytes = self.load_ta(&uuid)?;
+                let cookie_us = cookie as usize;
+                let after = (cookie_us + msg_sz + 7) & !7;
+                let tmem = n >= 2 && is_tmem(params[1].attr) && (params[1].a as usize) >= cookie_us;
+                let dest = if tmem && (params[1].b as usize) >= bytes.len() {
+                    params[1].a as usize
+                } else {
+                    after
+                };
+                let end = dest.checked_add(bytes.len()).ok_or(SuppError::Io)?;
+                if end > bounce.len() {
+                    return Err(SuppError::Io);
                 }
+                bounce[dest..end].copy_from_slice(&bytes);
+                let out_n = n.max(2);
+                params[1] = MsgParam::tmem(
+                    ATTR_TYPE_TMEM_OUTPUT,
+                    dest as u64,
+                    bytes.len() as u64,
+                    dest as u64,
+                );
+                hdr.num_params = out_n as u32;
+                hdr.ret = 0;
+                rustee_proto::write_msg(bounce, cookie, hdr, &params[..out_n])
+                    .map_err(|_| SuppError::Io)?;
+                return Ok((end - cookie_us) as u32);
             }
             RPC_CMD_FS => {
                 if n < 1 {
@@ -179,7 +201,7 @@ impl Supplicant {
             _ => return Err(SuppError::BadCmd),
         }
         rustee_proto::write_msg(bounce, cookie, hdr, &params[..n]).map_err(|_| SuppError::Io)?;
-        Ok(())
+        Ok(window)
     }
 
 
@@ -221,12 +243,19 @@ pub fn install(s: Supplicant) {
     *GLOBAL.lock().expect("supp") = Some(s);
 }
 
-pub fn rpc_hook(bounce: &mut [u8], cookie: u64) -> Result<(), u32> {
+pub fn rpc_hook(bounce: &mut [u8], cookie: u64) -> Result<u32, u32> {
     let mut g = GLOBAL.lock().expect("supp");
     g.as_mut()
         .ok_or(0xFFFF_000Eu32)?
         .handle_msg(bounce, cookie)
         .map_err(|_| 0xFFFF_000Eu32)
+}
+
+fn is_tmem(attr: u64) -> bool {
+    matches!(
+        attr & ATTR_TYPE_MASK,
+        ATTR_TYPE_TMEM_INPUT | ATTR_TYPE_TMEM_OUTPUT | ATTR_TYPE_TMEM_INOUT
+    )
 }
 
 #[cfg(test)]
@@ -278,6 +307,43 @@ mod tests {
         s.fs(RPC_FS_WRITE, "", fd, 0, b"x").unwrap();
         s.fs(RPC_FS_CLOSE, "", fd, 0, &[]).unwrap();
         assert!(dir.join(path).is_file());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_ta_copies_elf_into_tmem() {
+        use rustee_proto::{decode_msg, write_msg, ATTR_TYPE_MASK, ATTR_TYPE_TMEM_OUTPUT, ATTR_TYPE_VALUE_INPUT, MsgArgHdr, MsgParam};
+        let dir = env::temp_dir().join("rustee-supp-loadta");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Supplicant::new(dir.clone()).unwrap();
+        let uuid_hex = "8d825f6a1c4b4c9f9e3a2b7c6d5e4f30";
+        let ta_dir = dir.join("ta");
+        fs::create_dir_all(&ta_dir).unwrap();
+        let elf = b"\x7fELF-hello-rs-test-image";
+        fs::write(ta_dir.join(format!("{uuid_hex}.ta")), elf).unwrap();
+        let mut bounce = vec![0u8; 4096];
+        let cookie = 64u64;
+        let hi = u64::from_str_radix(&uuid_hex[..16], 16).unwrap();
+        let lo = u64::from_str_radix(&uuid_hex[16..], 16).unwrap();
+        let hdr = MsgArgHdr {
+            cmd: RPC_CMD_LOAD_TA,
+            num_params: 2,
+            ..MsgArgHdr::default()
+        };
+        let params = [
+            MsgParam::value(ATTR_TYPE_VALUE_INPUT, hi, lo, 0),
+            MsgParam::default(),
+        ];
+        write_msg(&mut bounce, cookie, hdr, &params).unwrap();
+        let window = s.handle_msg(&mut bounce, cookie).unwrap();
+        let (out, p, _) = decode_msg(&bounce, cookie).unwrap();
+        assert_eq!(out.ret, 0);
+        assert_eq!(p[1].attr & ATTR_TYPE_MASK, ATTR_TYPE_TMEM_OUTPUT);
+        let dest = p[1].a as usize;
+        let sz = p[1].b as usize;
+        assert_eq!(sz, elf.len());
+        assert_eq!(&bounce[dest..dest + sz], elf);
+        assert!(window as usize >= dest + sz - cookie as usize);
         let _ = fs::remove_dir_all(dir);
     }
 }
