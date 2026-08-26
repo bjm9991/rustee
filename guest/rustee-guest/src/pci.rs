@@ -140,14 +140,16 @@ unsafe fn enable_mem_busmaster(d: &PciDev) {
 }
 
 /// Map BAR `bar` (0..5) and return MMIO base. Handles 64-bit BARs (type bit 2).
-pub unsafe fn map_bar(d: &PciDev, bar: u8) -> u64 {
+/// I/O BARs (`orig_lo & 1`) return `None` — QEMU virtio-pci BAR0 is legacy PIO;
+/// modern common/notify/device live in a memory BAR. Do not halt.
+pub unsafe fn map_bar(d: &PciDev, bar: u8) -> Option<u64> {
     if let Some(b) = cached(d, bar) {
-        return b;
+        return Some(b);
     }
     let off = 0x10 + bar as u16 * 4;
     let orig_lo = cfg_read32(d.bus, d.dev, d.func, off);
     if orig_lo & 1 != 0 {
-        crate::uart::fail_halt("I/O BAR not supported");
+        return None;
     }
     let is_64 = (orig_lo & 0x6) == 0x4;
     let size = if is_64 {
@@ -186,5 +188,5 @@ pub unsafe fn map_bar(d: &PciDev, bar: u8) -> u64 {
         remember(d, bar, base);
     }
     enable_mem_busmaster(d);
-    base
+    Some(base)
 }

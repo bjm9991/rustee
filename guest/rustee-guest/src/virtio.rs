@@ -84,16 +84,27 @@ impl VirtioPci {
             let next = pci::cfg_read8(d.bus, d.dev, d.func, cap as u16 + 1);
             if id == 0x09 {
                 let (t, bar, _, off, _) = cap_at(d, cap);
-                let base = pci::map_bar(d, bar);
-                let addr = base + off as u64;
+                // COMMON/NOTIFY/ISR/DEVICE only. PCI_CFG (type 5) often names
+                // BAR0, which is legacy I/O on QEMU virtio-pci — skip, do not map.
                 match t {
-                    CAP_COMMON => common = addr,
-                    CAP_NOTIFY => {
-                        notify = addr;
-                        notify_mul = pci::cfg_read32(d.bus, d.dev, d.func, cap as u16 + 16);
+                    CAP_COMMON | CAP_NOTIFY | CAP_ISR | CAP_DEVICE => {
+                        let Some(base) = pci::map_bar(d, bar) else {
+                            cap = next;
+                            continue;
+                        };
+                        let addr = base + off as u64;
+                        match t {
+                            CAP_COMMON => common = addr,
+                            CAP_NOTIFY => {
+                                notify = addr;
+                                notify_mul =
+                                    pci::cfg_read32(d.bus, d.dev, d.func, cap as u16 + 16);
+                            }
+                            CAP_DEVICE => device = addr,
+                            CAP_ISR => {}
+                            _ => {}
+                        }
                     }
-                    CAP_DEVICE => device = addr,
-                    CAP_ISR => {}
                     _ => {}
                 }
             }
