@@ -111,27 +111,19 @@ fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
-unsafe fn alloc_mmio(size: u64, is_64: bool) -> u64 {
+unsafe fn alloc_mmio(size: u64, _is_64: bool) -> u64 {
+    // 64-bit BARs still take a 32-bit address (high dword 0) in QEMU virt's
+    // PCI MMIO window at 0x10000000, which is identity-mapped. Assigning
+    // 0x8000000000 hung qemu-smoke on the first common-cfg access after #40.
     let size = size.max(0x1000);
-    if is_64 {
-        let cur = addr_of_mut!(NEXT_MMIO64);
-        let base = align_up(*cur, size);
-        let next = base.saturating_add(size);
-        if next > MMIO64_END {
-            crate::uart::fail_halt("64-bit MMIO window exhausted");
-        }
-        *cur = next;
-        base
-    } else {
-        let cur = addr_of_mut!(NEXT_MMIO32);
-        let base = align_up(*cur, size);
-        let next = base.saturating_add(size);
-        if next > MMIO32_END {
-            crate::uart::fail_halt("32-bit MMIO window exhausted");
-        }
-        *cur = next;
-        base
+    let cur = addr_of_mut!(NEXT_MMIO32);
+    let base = align_up(*cur, size);
+    let next = base.saturating_add(size);
+    if next > MMIO32_END {
+        crate::uart::fail_halt("32-bit MMIO window exhausted");
     }
+    *cur = next;
+    base
 }
 
 unsafe fn enable_mem_busmaster(d: &PciDev) {

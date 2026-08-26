@@ -182,6 +182,9 @@ impl VirtioPci {
         self.w64(48, pa + used_off);
         self.w16(28, 1); // queue_enable
         let n_off = self.r16(30) as u32; // queue_notify_off
+        if self.notify.is_null() {
+            crate::uart::fail_halt("virtio notify BAR missing");
+        }
         let notify = self.notify.add((n_off * self.notify_off_mul) as usize) as *mut u16;
         const NONE: Option<Vec<u8>> = None;
         Virtq {
@@ -292,4 +295,5 @@ pub unsafe fn rng_fill(dev: &VirtioPci, buf: &mut [u8]) {
         }
         core::hint::spin_loop();
     }
+    crate::uart::fail_halt("virtio-rng timeout");
 }
