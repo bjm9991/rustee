@@ -19,7 +19,7 @@ use rustee_hal_virt::{
     VIRTIO_VSOCK_HDR_LEN, VIRTIO_VSOCK_OP_CREDIT_REQUEST, VIRTIO_VSOCK_OP_CREDIT_UPDATE,
     VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RW, VSOCK_GUEST_CID, VSOCK_PORT,
 };
-use rustee_os::{HalRpc, Kernel, KernelCmd, KernelOut, MemrefSrc, Param, RpcResponse, Uuid};
+use rustee_os::{HalRpc, Kernel, KernelCmd, KernelOut, MemrefSrc, Param, RpcResponse, Uuid, PARAM_COUNT};
 
 core::arch::global_asm!(
     r#"
@@ -161,6 +161,7 @@ unsafe fn vsock_loop(
                     if waiting.is_some() {
                         match k.hal_mut().recv_rpc_reply() {
                             Ok(_) => {
+                                let _ = writeln!(uart, "vsock-rpc-complete");
                                 let enter = waiting.take().unwrap();
                                 handle_rpc_reply(k, uart, tx, enter, &mut waiting);
                             }
@@ -220,7 +221,7 @@ fn handle_enter(
                     .hal_mut()
                     .bounce_at_mut(0, rustee_hal_virt::BOUNCE_POOL_SIZE)
                 {
-                    proto_cmd::write_done(buf, cookie, 0xFFFF_0006, 4, 0);
+                    proto_cmd::write_done(buf, cookie, 0xFFFF_0006, 4, 0, &[Param::None; PARAM_COUNT]);
                 }
                 if let Ok((vh, pdu)) = k.hal_mut().complete_stream(frame) {
                     send_rw(tx, vh, &pdu);
@@ -246,8 +247,14 @@ fn handle_rpc_reply(
             crate::uart::fail_halt("bounce");
         };
         match proto_cmd::take_load_ta(pool) {
-            Ok(bytes) => RpcResponse::LoadTa { bytes },
-            Err(code) => RpcResponse::Error { code },
+            Ok(bytes) => {
+                let _ = writeln!(uart, "vsock-rpc-reply {}", bytes.len());
+                RpcResponse::LoadTa { bytes }
+            }
+            Err(code) => {
+                let _ = writeln!(uart, "vsock-rpc-reply-err {code:#x}");
+                RpcResponse::Error { code }
+            }
         }
     };
     let out = k.handle(KernelCmd::RpcComplete { resp });
@@ -264,7 +271,9 @@ fn dispatch_out(
 ) {
     match out {
         KernelOut::Done {
-            result, session, ..
+            result,
+            session,
+            params,
         } => {
             let cookie = frame.cookie_a1a2();
             if let Some(buf) = k
@@ -277,11 +286,12 @@ fn dispatch_out(
                     result.code,
                     result.origin.as_gp(),
                     session.map(|s| s.0).unwrap_or(0),
+                    &params,
                 );
             }
             if let Ok((vh, pdu)) = k.hal_mut().complete_stream(frame) {
                 send_rw(tx, vh, &pdu);
-                let _ = writeln!(uart, "vsock-complete");
+                let _ = writeln!(uart, "vsock-complete {:#x}", result.code);
             } else {
                 let _ = writeln!(uart, "vsock-complete-drop");
             }

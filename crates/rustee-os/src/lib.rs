@@ -618,7 +618,10 @@ impl<H: Hal, C: CryptoProvider> Kernel<H, C> {
                             KernelOut::done_err(TEE_ERROR_SECURITY)
                         } else {
                             let mut aspace = self.hal.new_address_space();
-                            let entries = map_elf(&mut aspace, &bytes).ok().flatten();
+                            let entries = match map_elf(&mut aspace, &bytes) {
+                                Ok(e) => e,
+                                Err(code) => return KernelOut::done_err(code),
+                            };
                             self.instantiate_and_bind(
                                 props,
                                 uuid,
@@ -668,8 +671,8 @@ mod tests {
 
     struct MockAs;
     impl AddressSpace for MockAs {
-        fn map_image(&mut self, _: VirtAddr, _: &[u8], _: Perms) -> Result<(), HalError> {
-            Ok(())
+        fn map_image(&mut self, va: VirtAddr, _: &[u8], _: Perms) -> Result<VirtAddr, HalError> {
+            Ok(va)
         }
         fn map_shm(&mut self, _: &impl SharedMem, perms: Perms) -> Result<VirtAddr, HalError> {
             if perms.exec {

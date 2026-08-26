@@ -163,38 +163,195 @@ pub fn _section_name() -> &'static str {
 use crate::abi::TaEntryPoints;
 use rustee_hal::{AddressSpace, HalError, Perms, VirtAddr};
 
-/// Map PT_LOAD into the TA aspace. On aarch64, bind GP TA_* VAs as entry points.
+/// Cap a v0 TA image. Hello-rs is well under this; bigger TAs are a later profile.
+const MAX_TA_SPAN: usize = 16 * 1024 * 1024;
+
+/// Map PT_LOAD into the TA aspace as one contiguous blob so text/data keep a
+/// single slide (aarch64 ADRP is PC-relative). BSS is zero-filled to mem_size.
+/// On aarch64, bind GP TA_* as `symbol + (mapped_va - min_va)`.
 pub fn map_elf<A: AddressSpace>(aspace: &mut A, bytes: &[u8]) -> Result<Option<TaEntryPoints>, u32> {
     let img = parse_elf(bytes)?;
-    for seg in &img.segs {
-        let end = seg.file_off.saturating_add(seg.file_size);
-        let src = bytes.get(seg.file_off..end).ok_or(TEE_ERROR_BAD_PARAMETERS)?;
-        let perms = if seg.exec { Perms::RX } else { Perms::RW };
-        aspace
-            .map_image(VirtAddr(seg.va), src, perms)
-            .map_err(|_| TEE_ERROR_BAD_PARAMETERS)?;
+    if img.segs.is_empty() {
+        return Ok(bind_symbols(img.symbols, 0));
     }
-    Ok(bind_symbols(img.symbols))
+    let min_va = img.segs.iter().map(|s| s.va).min().unwrap();
+    let max_end = img
+        .segs
+        .iter()
+        .map(|s| s.va.saturating_add(s.mem_size.max(s.file_size) as u64))
+        .max()
+        .unwrap();
+    let span = max_end
+        .checked_sub(min_va)
+        .ok_or(TEE_ERROR_BAD_PARAMETERS)? as usize;
+    if span == 0 || span > MAX_TA_SPAN {
+        return Err(TEE_ERROR_BAD_PARAMETERS);
+    }
+    let mut blob = alloc::vec![0u8; span];
+    for seg in &img.segs {
+        let off = (seg.va - min_va) as usize;
+        let n = seg.file_size.min(seg.mem_size);
+        let end = seg.file_off.saturating_add(n);
+        let src = bytes
+            .get(seg.file_off..end)
+            .ok_or(TEE_ERROR_BAD_PARAMETERS)?;
+        let dest = off.checked_add(n).ok_or(TEE_ERROR_BAD_PARAMETERS)?;
+        if dest > blob.len() {
+            return Err(TEE_ERROR_BAD_PARAMETERS);
+        }
+        blob[off..dest].copy_from_slice(src);
+    }
+    let mapped = aspace
+        .map_image(VirtAddr(min_va), &blob, Perms::RX)
+        .map_err(|_| TEE_ERROR_BAD_PARAMETERS)?;
+    let slide = mapped.0.wrapping_sub(min_va);
+    Ok(bind_symbols(img.symbols, slide))
 }
 
-fn bind_symbols(symbols: Option<TaSymbols>) -> Option<TaEntryPoints> {
+fn bind_symbols(symbols: Option<TaSymbols>, slide: u64) -> Option<TaEntryPoints> {
     let s = symbols?;
+    let adj = |v: u64| v.wrapping_add(slide) as usize;
     #[cfg(target_arch = "aarch64")]
     unsafe {
         return Some(TaEntryPoints {
-            create: core::mem::transmute(s.create as usize),
-            destroy: core::mem::transmute(s.destroy as usize),
-            open_session: core::mem::transmute(s.open_session as usize),
-            close_session: core::mem::transmute(s.close_session as usize),
-            invoke: core::mem::transmute(s.invoke as usize),
+            create: core::mem::transmute(adj(s.create)),
+            destroy: core::mem::transmute(adj(s.destroy)),
+            open_session: core::mem::transmute(adj(s.open_session)),
+            close_session: core::mem::transmute(adj(s.close_session)),
+            invoke: core::mem::transmute(adj(s.invoke)),
         });
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = s;
+        let _ = (s, adj);
         None
     }
 }
 
 #[allow(dead_code)]
 fn _hal_error(_: HalError) {}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+    use crate::header::{encode_ta_head, TaProperties};
+    use crate::abi::Uuid;
+    use rustee_hal::{HalError, SharedMem};
+
+    struct RecAs {
+        va: u64,
+        blob: alloc::vec::Vec<u8>,
+        load: u64,
+    }
+
+    impl AddressSpace for RecAs {
+        fn map_image(
+            &mut self,
+            va: VirtAddr,
+            src: &[u8],
+            _: Perms,
+        ) -> Result<VirtAddr, HalError> {
+            self.va = va.0;
+            self.blob = src.to_vec();
+            Ok(VirtAddr(self.load))
+        }
+        fn map_shm(&mut self, _: &impl SharedMem, _: Perms) -> Result<VirtAddr, HalError> {
+            Err(HalError::Unsupported)
+        }
+        fn unmap(&mut self, _: VirtAddr) {}
+        fn drop_all(&mut self) {}
+    }
+
+    fn put_u16(b: &mut [u8], o: usize, v: u16) {
+        b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u32(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u64(b: &mut [u8], o: usize, v: u64) {
+        b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// ELF64 LE, one PT_LOAD at 0x10000 covering the file, memsz = filesz+16,
+    /// `.rustee.ta_head` section with a valid RTAH.
+    fn loadable_elf() -> alloc::vec::Vec<u8> {
+        let props = TaProperties {
+            uuid: Uuid([9; 16]),
+            stack_size: 4096,
+            data_size: 4096,
+            single_instance: true,
+            multi_session: true,
+            instance_keep_alive: false,
+            endian: 0,
+            ta_version: 1,
+        };
+        let head = encode_ta_head(&props);
+        let shstr = b"\0.rustee.ta_head\0.shstrtab\0";
+        let ehdr = 64usize;
+        let phdr = 56usize;
+        let shstr_off = ehdr + phdr;
+        let head_off = shstr_off + shstr.len();
+        let shoff = (head_off + 40 + 7) & !7;
+        let shnum = 3usize;
+        let file_sz = shoff + shnum * 64;
+        let mut b = alloc::vec![0u8; file_sz];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[6] = 1;
+        put_u16(&mut b, 16, 2); // ET_EXEC
+        put_u16(&mut b, 18, 183); // EM_AARCH64
+        put_u32(&mut b, 20, 1);
+        put_u64(&mut b, 24, 0x10000);
+        put_u64(&mut b, 32, ehdr as u64); // phoff
+        put_u64(&mut b, 40, shoff as u64);
+        put_u16(&mut b, 52, 64);
+        put_u16(&mut b, 54, 56);
+        put_u16(&mut b, 56, 1);
+        put_u16(&mut b, 58, 64);
+        put_u16(&mut b, 60, shnum as u16);
+        put_u16(&mut b, 62, 2); // shstrndx
+        // PT_LOAD
+        put_u32(&mut b, ehdr, 1);
+        put_u32(&mut b, ehdr + 4, 5); // RX
+        put_u64(&mut b, ehdr + 8, 0);
+        put_u64(&mut b, ehdr + 16, 0x10000);
+        put_u64(&mut b, ehdr + 24, 0x10000);
+        put_u64(&mut b, ehdr + 32, file_sz as u64);
+        put_u64(&mut b, ehdr + 40, (file_sz + 16) as u64);
+        put_u64(&mut b, ehdr + 48, 0x1000);
+        b[shstr_off..shstr_off + shstr.len()].copy_from_slice(shstr);
+        b[head_off..head_off + 40].copy_from_slice(&head);
+        // shdr 0 null
+        // shdr 1 .rustee.ta_head
+        let s1 = shoff + 64;
+        put_u32(&mut b, s1, 1); // name off
+        put_u32(&mut b, s1 + 4, 1); // SHT_PROGBITS
+        put_u64(&mut b, s1 + 24, head_off as u64);
+        put_u64(&mut b, s1 + 32, 40);
+        // shdr 2 .shstrtab
+        let s2 = shoff + 128;
+        put_u32(&mut b, s2, 18); // name off of .shstrtab
+        put_u32(&mut b, s2 + 4, 3); // SHT_STRTAB
+        put_u64(&mut b, s2 + 24, shstr_off as u64);
+        put_u64(&mut b, s2 + 32, shstr.len() as u64);
+        b
+    }
+
+    #[test]
+    fn map_elf_copies_bss_and_slides() {
+        let elf = loadable_elf();
+        let filesz = elf.len();
+        let mut aspace = RecAs {
+            va: 0,
+            blob: alloc::vec::Vec::new(),
+            load: 0x5000_0000,
+        };
+        let entries = map_elf(&mut aspace, &elf).unwrap();
+        assert!(entries.is_none(), "host tests are not aarch64 bind");
+        assert_eq!(aspace.va, 0x10000);
+        assert_eq!(aspace.blob.len(), filesz + 16);
+        assert_eq!(&aspace.blob[filesz..], &[0u8; 16]);
+        assert_eq!(&aspace.blob[..4], b"\x7fELF");
+    }
+}

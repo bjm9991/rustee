@@ -40,8 +40,10 @@ pub unsafe fn enable() {
         | (0b11 << 8) // Inner shareable
         | (0b010 << 32); // IPS 40-bit PA
     let ttbr = addr_of!(L0) as u64;
+    let vbar = exception_vectors as *const () as u64;
 
     asm!(
+        "msr vbar_el1, {vbar}",
         "msr mair_el1, {mair}",
         "msr tcr_el1, {tcr}",
         "msr ttbr0_el1, {ttbr}",
@@ -54,9 +56,72 @@ pub unsafe fn enable() {
         "orr {tmp}, {tmp}, #(1 << 12)",
         "msr sctlr_el1, {tmp}",
         "isb",
+        vbar = in(reg) vbar,
         mair = in(reg) mair,
         tcr = in(reg) tcr,
         ttbr = in(reg) ttbr,
         tmp = out(reg) _,
     );
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .align 11
+    .global exception_vectors
+exception_vectors:
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b sync_el1h
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+    .align 7
+    b hang_exc
+hang_exc:
+    b hang_exc
+"#
+);
+
+extern "C" {
+    fn exception_vectors();
+}
+
+#[no_mangle]
+extern "C" fn sync_el1h() -> ! {
+    let (esr, elr, far): (u64, u64, u64);
+    unsafe {
+        asm!(
+            "mrs {esr}, esr_el1",
+            "mrs {elr}, elr_el1",
+            "mrs {far}, far_el1",
+            esr = out(reg) esr,
+            elr = out(reg) elr,
+            far = out(reg) far,
+        );
+    }
+    crate::uart::fail_halt_fmt(esr, elr, far);
 }

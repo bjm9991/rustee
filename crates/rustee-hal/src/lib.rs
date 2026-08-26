@@ -203,7 +203,10 @@ pub trait CallGate {
 }
 
 pub trait AddressSpace {
-    fn map_image(&mut self, va: VirtAddr, src: &[u8], perms: Perms) -> Result<(), HalError>;
+    /// Place `src` so a TA can run it. Returns the VA where byte 0 is callable.
+    /// On virt this may differ from `va` (load slide); the kernel relocates TA_* by
+    /// `mapped.0.wrapping_sub(va.0)`. `perms.exec` requires a non-empty image.
+    fn map_image(&mut self, va: VirtAddr, src: &[u8], perms: Perms) -> Result<VirtAddr, HalError>;
     fn map_shm(&mut self, shm: &impl SharedMem, perms: Perms) -> Result<VirtAddr, HalError>;
     fn unmap(&mut self, va: VirtAddr);
     fn drop_all(&mut self);

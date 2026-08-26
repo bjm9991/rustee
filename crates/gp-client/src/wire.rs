@@ -10,6 +10,8 @@ use crate::{TEEC_ERROR_BUSY, TEEC_ERROR_COMMUNICATION};
 
 pub const GUEST_CID: u32 = VSOCK_GUEST_CID;
 pub const GUEST_PORT: u32 = VSOCK_PORT;
+/// Connect and PDU IO. A silent 30s hang is a CI timeout, not a TEEC code.
+pub const VSOCK_TIMEOUT_MS: i32 = 5_000;
 
 /// One outstanding yielding call over a byte stream (AF_VSOCK or a test pipe).
 pub struct StreamTransport<S> {
@@ -142,12 +144,39 @@ impl<S: Read + Write> crate::Transport for StreamTransport<S> {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+fn set_timeo(fd: i32, secs: i64) -> Result<(), u32> {
+    let tv = libc::timeval {
+        tv_sec: secs,
+        tv_usec: 0,
+    };
+    let n = core::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    let p = &tv as *const _ as *const libc::c_void;
+    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, p, n) } != 0 {
+        return Err(TEEC_ERROR_COMMUNICATION);
+    }
+    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, p, n) } != 0 {
+        return Err(TEEC_ERROR_COMMUNICATION);
+    }
+    Ok(())
+}
+
 pub fn connect_vsock(cid: u32, port: u32) -> Result<std::os::fd::OwnedFd, u32> {
+    use std::io::Error;
     use std::mem::MaybeUninit;
     use std::os::fd::{FromRawFd, OwnedFd};
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {
+            return Err(TEEC_ERROR_COMMUNICATION);
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags < 0 {
+            libc::close(fd);
+            return Err(TEEC_ERROR_COMMUNICATION);
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != 0 {
+            libc::close(fd);
             return Err(TEEC_ERROR_COMMUNICATION);
         }
         let mut addr = MaybeUninit::<libc::sockaddr_vm>::zeroed().assume_init();
@@ -160,6 +189,41 @@ pub fn connect_vsock(cid: u32, port: u32) -> Result<std::os::fd::OwnedFd, u32> {
             core::mem::size_of::<libc::sockaddr_vm>() as u32,
         );
         if rc != 0 {
+            let e = Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e != libc::EINPROGRESS {
+                libc::close(fd);
+                return Err(TEEC_ERROR_COMMUNICATION);
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let n = libc::poll(&mut pfd, 1, VSOCK_TIMEOUT_MS);
+            if n <= 0 {
+                libc::close(fd);
+                return Err(TEEC_ERROR_COMMUNICATION);
+            }
+            let mut so_err: libc::c_int = 0;
+            let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            if libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_err as *mut _ as *mut libc::c_void,
+                &mut len,
+            ) != 0
+                || so_err != 0
+            {
+                libc::close(fd);
+                return Err(TEEC_ERROR_COMMUNICATION);
+            }
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags) != 0 {
+            libc::close(fd);
+            return Err(TEEC_ERROR_COMMUNICATION);
+        }
+        if set_timeo(fd, (VSOCK_TIMEOUT_MS / 1000) as i64).is_err() {
             libc::close(fd);
             return Err(TEEC_ERROR_COMMUNICATION);
         }
@@ -179,6 +243,11 @@ mod tests {
     use crate::Transport;
     use rustee_proto::{KIND_COMPLETE, KIND_RPC, SMC_CALL_WITH_ARG};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn vsock_timeout_is_five_seconds() {
+        assert_eq!(VSOCK_TIMEOUT_MS, 5_000);
+    }
 
     #[test]
     fn unix_pair_enter_complete_copies_bounce() {
