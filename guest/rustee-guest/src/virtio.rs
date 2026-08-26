@@ -46,6 +46,7 @@ pub struct Virtq {
     q: *mut SplitQ,
     last_used: u16,
     notify: *mut u16,
+    qidx: u16,
     /// TX packet buffers. Slot `i` is live while desc `i` is in flight.
     bufs: [Option<Vec<u8>>; QSIZE],
     inflight: [bool; QSIZE],
@@ -142,6 +143,12 @@ impl VirtioPci {
 
     pub unsafe fn reset_and_ack(&self) {
         self.w8(20, 0); // device_status
+        for _ in 0..100_000 {
+            if self.r8(20) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
                         // common cfg layout (virtio 1.2):
                         // 0 device_feature_select u32
                         // 4 device_feature u32
@@ -191,6 +198,7 @@ impl VirtioPci {
             q,
             last_used: 0,
             notify,
+            qidx: idx,
             bufs: [NONE; QSIZE],
             inflight: [false; QSIZE],
         }
@@ -252,7 +260,7 @@ impl Virtq {
         q.avail_ring[(idx as usize) % QSIZE] = id;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         q.avail_idx = idx.wrapping_add(1);
-        core::ptr::write_volatile(self.notify, 0);
+        core::ptr::write_volatile(self.notify, self.qidx);
     }
 
     pub unsafe fn add_out(&mut self, buf: *const u8, len: u32, id: u16) {
@@ -268,7 +276,7 @@ impl Virtq {
         q.avail_ring[(idx as usize) % QSIZE] = id;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         q.avail_idx = idx.wrapping_add(1);
-        core::ptr::write_volatile(self.notify, 0);
+        core::ptr::write_volatile(self.notify, self.qidx);
     }
 
     pub unsafe fn poll_used(&mut self) -> Option<(u16, u32)> {
@@ -286,8 +294,7 @@ impl Virtq {
     }
 }
 
-pub unsafe fn rng_fill(dev: &VirtioPci, buf: &mut [u8]) {
-    let mut q = dev.setup_queue(0);
+pub unsafe fn rng_fill(q: &mut Virtq, buf: &mut [u8]) {
     q.add_in(buf.as_mut_ptr(), buf.len() as u32, 0);
     for _ in 0..1_000_000 {
         if q.poll_used().is_some() {

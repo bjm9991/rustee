@@ -71,9 +71,11 @@ extern "C" fn rust_main() -> ! {
         let _ = writeln!(uart, "rng-probe");
         v.reset_and_ack();
         let _ = writeln!(uart, "rng-features");
-        let mut buf = [0u8; 64];
-        virtio::rng_fill(&v, &mut buf);
+        let mut rq = v.setup_queue(0);
         v.driver_ok();
+        let _ = writeln!(uart, "rng-driver-ok");
+        let mut buf = [0u8; 64];
+        virtio::rng_fill(&mut rq, &mut buf);
         let _ = writeln!(uart, "rng-entropy");
         let mut h = VirtHal::new();
         h.feed_rng(&buf);
