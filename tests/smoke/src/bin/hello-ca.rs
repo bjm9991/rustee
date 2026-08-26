@@ -43,11 +43,15 @@ fn run(root: PathBuf) -> Result<usize, u32> {
     let supp = Supplicant::new(root.clone()).map_err(|_| 0xFFFF_000Eu32)?;
     stage_hello_ta(&root)?;
     rustee_supplicant::install(supp);
+    eprintln!("hello-ca: connect {GUEST_CID}:{GUEST_PORT}");
     let mut t = vsock_transport(GUEST_CID, GUEST_PORT)?;
+    eprintln!("hello-ca: connected");
     t.on_rpc = Some(rustee_supplicant::rpc_hook);
     let mut ctx = Context::new(t);
     ctx.initialize()?;
+    eprintln!("hello-ca: open hello-rs");
     let sid = ctx.open_session(&Uuid::from_bytes(HELLO_RS_UUID_BYTES), TEEC_LOGIN_PUBLIC)?;
+    eprintln!("hello-ca: session {sid}");
     let mut dst = [0u8; 16];
     let n = ctx.invoke_shm(sid, 0, b"hello-rs", &mut dst)?;
     if &dst[..n] != b"hello-rs" {
