@@ -19,7 +19,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use rustee_hal::{
-    AddressSpace, BootInfo, CallFrame, CallGate, Entropy, EntropyOrigin, Hal, HalError, Huk,
+    AddressSpace, BootInfo, CallFrame, CallGate, Hal, HalError, Huk,
     Irq, KernelCmd, Monotonic, Perms, PhysRegion, SecureTime, SharedMem, Unsupported,
     VirtAddr, PAGE_SIZE,
 };
@@ -482,6 +482,7 @@ fn _irq_is_unused(_: &dyn Irq, _: &dyn Monotonic, _: &dyn SecureTime) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustee_hal::{Entropy, EntropyOrigin};
 
     #[test]
     fn pdu_roundtrip() {

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-//! QEMU virt ECAM at 0x4010_0000_0000. 32-bit MMIO from 0x1000_0000;
+//! QEMU virt ECAM at 0x40_1000_0000. 32-bit MMIO from 0x1000_0000;
 //! 64-bit BARs from high MMIO 0x8000_0000_0000.
 use core::ptr::{addr_of, addr_of_mut};
 
-const ECAM: u64 = 0x4010_0000_0000;
+const ECAM: u64 = 0x40_1000_0000;
 const MMIO32_BASE: u64 = 0x1000_0000;
 const MMIO32_END: u64 = 0x3e00_0000;
 const MMIO64_BASE: u64 = 0x8000_0000_0000;
@@ -177,7 +177,7 @@ pub unsafe fn map_bar(d: &PciDev, bar: u8) -> u64 {
         }
     };
     let base = alloc_mmio(size, is_64);
-    cfg_write32(d.bus, d.dev, d.func, off, base as u32);
+    cfg_write32(d.bus, d.dev, d.func, off, (base as u32 & !0xf) | (orig_lo & 0xf));
     if is_64 {
         cfg_write32(d.bus, d.dev, d.func, off + 4, (base >> 32) as u32);
         remember(d, bar, base);
